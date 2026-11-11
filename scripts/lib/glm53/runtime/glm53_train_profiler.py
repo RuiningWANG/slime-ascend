@@ -21,7 +21,10 @@ Environment variables (normally injected via ``--train-env-vars``):
   GLM53_PROFILE_AIC=AiCoreNone   AiCMetrics member (Level1/Level2 only)
   GLM53_PROFILE_WITH_STACK=0     1 = record python call stacks
   GLM53_PROFILE_MEMORY=0         1 = record profiler memory events
-  GLM53_PROFILE_MICROBATCHES=0   >0 = profile only N micro-batches (+optimizer) of the step
+  GLM53_PROFILE_MICROBATCHES=0   >0 = profile only N micro-batches of the step.  N counts
+                                 complete forward+backward passes: the pipeline warm-up
+                                 forwards (pp_size-1-r on stage r) that have no backward
+                                 yet are skipped automatically.
   GLM53_MEM_SNAPSHOT=0           1 = record one step's allocator history
   GLM53_MEM_SNAPSHOT_STEP=<int>  step to record (default 1)
   GLM53_MEM_SNAPSHOT_FILE=<path> pickle output (default /tmp/glm53_mem_step<N>.pickle)
@@ -81,6 +84,21 @@ def _selected(rank: int) -> bool:
         return True
 
 
+def _pipeline_geometry() -> tuple[int, int]:
+    """(pp_size, pp_rank) of this rank's pipeline group; (1, 0) if unknown."""
+    try:
+        from megatron.core import parallel_state
+
+        if parallel_state.is_initialized():
+            return (
+                parallel_state.get_pipeline_model_parallel_world_size(),
+                parallel_state.get_pipeline_model_parallel_rank(),
+            )
+    except Exception:
+        pass
+    return 1, 0
+
+
 def _start(rank: int, step_index: int, active: int) -> None:
     import torch_npu  # noqa: F401  registers the NPU profiler backend
     import torch_npu.profiler as npu_prof
@@ -90,6 +108,14 @@ def _start(rank: int, step_index: int, active: int) -> None:
     level = getattr(npu_prof.ProfilerLevel, level_name, npu_prof.ProfilerLevel.Level1)
     aic = getattr(npu_prof.AiCMetrics, aic_name, npu_prof.AiCMetrics.AiCoreNone)
     microbatch_target = _env_int("GLM53_PROFILE_MICROBATCHES", 0)
+
+    # prof.step() advances after every micro-batch *forward* (see on_microbatch),
+    # while the backward for a micro-batch runs later in the 1F1B schedule.  On
+    # pipeline stage r the first (pp_size - 1 - r) forwards have no backward yet,
+    # so N complete forward+backward pairs need N + pp_size - r profiler steps
+    # (N + 1 on a single stage).
+    pp_size, pp_rank = _pipeline_geometry()
+    micro_steps = microbatch_target + pp_size - pp_rank if microbatch_target > 0 else 0
 
     first = step_index
     last = step_index if microbatch_target > 0 else step_index + active - 1
@@ -105,7 +131,7 @@ def _start(rank: int, step_index: int, active: int) -> None:
         activities=[npu_prof.ProfilerActivity.CPU, npu_prof.ProfilerActivity.NPU],
         schedule=npu_prof.schedule(
             wait=0, warmup=0,
-            active=(microbatch_target + 1 if microbatch_target > 0 else active),
+            active=(micro_steps if microbatch_target > 0 else active),
             repeat=1,
         ),
         on_trace_ready=npu_prof.tensorboard_trace_handler(out_dir, worker_name=f"rank{rank}"),
@@ -123,12 +149,14 @@ def _start(rank: int, step_index: int, active: int) -> None:
 
     _STATE.update(
         prof=prof, saved=False, done=False,
-        micro_target=microbatch_target, micro_calls=0,
+        micro_target=microbatch_target, micro_steps=micro_steps, micro_calls=0,
         micro_done=False, micro_start_step=step_index,
     )
     logger.info(
-        "[glm53-profile] rank %s: profiling global train steps %s-%s -> %s",
-        rank, first, last, out_dir,
+        "[glm53-profile] rank %s: profiling %s micro-batches (%s profiler steps, "
+        "pp_size=%s pp_rank=%s) of global train step %s -> %s",
+        rank, microbatch_target or "all", micro_steps or active,
+        pp_size, pp_rank, first, out_dir,
     )
 
 
@@ -237,7 +265,8 @@ def before_train_step(args, rollout_id, step_id, model, optimizer, opt_param_sch
                 torch.npu.synchronize()
             except Exception:
                 pass
-            for _ in range(max(1, micro_target + 1 - _STATE.get("micro_calls", 0))):
+            needed = _STATE.get("micro_steps", micro_target + 1) - _STATE.get("micro_calls", 0)
+            for _ in range(max(1, needed)):
                 prof.step()
                 if _STATE["saved"]:
                     break

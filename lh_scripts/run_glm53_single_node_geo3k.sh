@@ -15,20 +15,29 @@ export GLM53_KDA_BWD_HEAD_CHUNK_SIZE=${GLM53_KDA_BWD_HEAD_CHUNK_SIZE:-64}
 # CPU packed boundaries and ViT alignment use the model's existing implementation.
 
 # Ray address on this machine's communication NIC; change when moving hosts.
-RAY_NODE_IP=${RAY_NODE_IP:-127.0.0.1}
+RAY_NODE_IP=${RAY_NODE_IP:-172.27.2.125}
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 GLM53_NUM_NPUS=16
 export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
 source "${SCRIPT_DIR}/../runtime/lh-ascend-runtime.sh"
 
+
 export HCCL_EXEC_TIMEOUT=3600 HCCL_CONNECT_TIMEOUT=3600 ACL_DEVICE_SYNC_TIMEOUT=3600
 
-HF_CHECKPOINT=${HF_CHECKPOINT:?Set HF_CHECKPOINT to the HF model directory}
-PROMPT_DATA=${PROMPT_DATA:?Set PROMPT_DATA to the JSONL dataset}
+HF_CHECKPOINT=/mnt/share/r30009656/code_project/GML5-3_s-b/start/CKPT/Geo3k/glm53_geo3k_sft-2/iter_0000400_bf16
+PROMPT_DATA=/mnt/share/r30009656/code_project/GML5-3_s-b/geo3k_dataset/geo3k_bench_519/geo3k_519_glm53_multimodal.jsonl
 EXPERIMENT_NAME=glm53_geo3k
 NUM_ROLLOUT=${NUM_ROLLOUT:-100}
-RM_TYPE=${RM_TYPE:-deepscaler}
+# Megatron checkpoints without optimizer/RNG state by default; rollout progress is retained.
+# Default: save at the final rollout (the trainer also saves at epoch boundaries).
+SAVE_INTERVAL=${SAVE_INTERVAL:-${NUM_ROLLOUT}}
+SAVE_DIR=${SAVE_DIR:-/mnt/share/l00937981/glm_53_flash_slime/cache/checkpoints/glm53_geo3k_$(date +%Y%m%d_%H%M%S)_$$}
+if [[ ! "$SAVE_INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
+    echo "SAVE_INTERVAL must be a positive integer" >&2
+    exit 2
+fi
+RM_TYPE=deepscaler
 CP_SIZE=1
 
 # Prompt limit includes the chat template. Total context capacity includes prompt and response.
@@ -86,6 +95,9 @@ TRAIN_ENV_JSON=$(/usr/bin/python3 -I -S - "$TRAIN_ENV_JSON" "$GLM53_MOE_DISPATCH
 import json
 import sys
 values = json.loads(sys.argv[1])
+# Keep HCCL WORLD alive: recreating it breaks custom SMLA metadata on CANN 9.2/A3.
+# Model offload and subgroup reload remain enabled; allow an explicit train-env override.
+values.setdefault("SLIME_DESTROY_WORLD_PROCESS_GROUP", "0")
 for key, raw in zip(("GLM53_MOE_DISPATCH_CHUNK_SIZE", "GLM53_EXPERT_TOKEN_CHUNK_SIZE"), sys.argv[2:]):
     size = int(raw)
     assert size >= 0, key
@@ -100,8 +112,11 @@ ARGS=(
     --train-env-vars "$TRAIN_ENV_JSON"
     "${MODEL_ARGS[@]}"
     --hf-checkpoint "$HF_CHECKPOINT" --load "$HF_CHECKPOINT" --megatron-to-hf-mode raw
+    --save "$SAVE_DIR" --save-interval "$SAVE_INTERVAL"
+    --no-save-optim --no-save-rng
     --prompt-data "$PROMPT_DATA" --input-key prompt --label-key label --apply-chat-template
     --multimodal-keys '{"image":"images"}'
+    --apply-chat-template-kwargs "$(cat /mnt/share/l00937981/glm_53_flash_slime/geometry3k/chat_template_kwargs.json)"
     --rm-type "${RM_TYPE:-deepscaler}" --seed 522
     --num-rollout "${NUM_ROLLOUT:-2}" --rollout-batch-size "$ROLLOUT_BATCH_SIZE" --n-samples-per-prompt "$N_SAMPLES_PER_PROMPT"
     --global-batch-size "$GLOBAL_BATCH_SIZE" --micro-batch-size 1
@@ -118,7 +133,7 @@ ARGS=(
     --use-dynamic-batch-size --max-tokens-per-gpu 2048 --data-pad-size-multiplier 1024
     --log-probs-chunk-size 1024
     --optimizer adam --lr 1e-6 --lr-decay-style constant --weight-decay 0.1 --adam-beta1 0.9 --adam-beta2 0.98
-    --no-load-optim --no-load-rng --no-save-optim --freeze-params-name-list 'model.visual.*'
+    --no-load-optim --no-load-rng --freeze-params-name-list 'model.visual.*'
     --optimizer-cpu-offload --use-precision-aware-optimizer
     --overlap-cpu-optimizer-d2h-h2d
     --rollout-num-gpus-per-engine 16

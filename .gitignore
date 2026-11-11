@@ -22,3 +22,6 @@ __pycache__/
 /rh_profiles/
 /lh_profiles/
 /glm53_profiles/
+
+# Credential for the Geo3K entry; never commit the token.
+/runtime/geo3k8-ray-auth-token

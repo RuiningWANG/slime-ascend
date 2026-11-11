@@ -1,0 +1,38 @@
+{
+  "date": "2026-11-11",
+  "source_environment": "/mnt/share/l00937981/glm_53_flash_slime",
+  "repositories": {
+    "slime-glm53-npu": {
+      "url": "https://github.com/lihanwen7/slime-glm53-npu.git",
+      "branch": "main",
+      "commit": "05ea89f48a4d63be5f79aa65d1236856db9973e7"
+    },
+    "sglang-glm53-npu": {
+      "url": "https://github.com/lihanwen7/sglang-glm53-npu.git",
+      "branch": "snapshot/glm53-shared-20261102",
+      "commit": "ec617fb315d2d8b7f1ab6152eb99ea07bcaa4f5f"
+    },
+    "Megatron-LM-glm53-npu": {
+      "url": "https://github.com/lihanwen7/Megatron-LM-glm53-npu.git",
+      "branch": "snapshot/glm53-shared-20261102",
+      "commit": "2715c3d1b86dc04f48c7375bfd3736ecb2fabfee"
+    },
+    "ops-transformer-glm53-npu": {
+      "url": "https://github.com/lihanwen7/ops-transformer-glm53-npu.git",
+      "branch": "main",
+      "commit": "967671f27659345f5ccc06f40a7b8219bfeda09b"
+    },
+    "sgl-kernel-npu-glm53": {
+      "url": "https://github.com/lihanwen7/sgl-kernel-npu-glm53.git",
+      "branch": "snapshot/glm53-shared-20261102",
+      "commit": "a906fe17d711df8b753e22551635de0a428f8b90"
+    }
+  },
+  "ops_transformer_upstream": "648d75322b53be04c3f4663b091f34df885df7f9",
+  "validation": {
+    "compatibility_tests": 38,
+    "python_and_shell_syntax": "passed",
+    "eight_host_run": "geo3k8_20261111_0140_shared_dp1_ep1_m75_b256_fence",
+    "note": "Historical eight-host validation; this publishing operation does not start training or rebuild installed operator packages."
+  }
+}

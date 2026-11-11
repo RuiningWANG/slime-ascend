@@ -1,0 +1,153 @@
+{
+  "checked_at": "2026-11-04T20:38:48.991039+08:00",
+  "deployment": "/mnt/share/l00937981/glm_53_flash_slime/slime-ascend",
+  "architecture": {
+    "layers": 45,
+    "experts": 288,
+    "topk": 8,
+    "checkpoint_shards": 120
+  },
+  "topology": {
+    "physical_hosts": 8,
+    "containers": 12,
+    "dies": 128,
+    "logical_groups": 16,
+    "dies_per_group": 8
+  },
+  "train": {
+    "tp": 1,
+    "pp": 4,
+    "cp": 8,
+    "ep": 32,
+    "dp": 4,
+    "smoke_batch": 16,
+    "long_batch": 128
+  },
+  "rollout": {
+    "engines": 2,
+    "tp": 64,
+    "logical_nodes_per_engine": 8
+  },
+  "static_checks": [
+    {
+      "host": "80.5.27.237",
+      "result": "PASS"
+    },
+    {
+      "host": "80.5.27.238",
+      "result": "PASS"
+    },
+    {
+      "host": "80.5.27.239",
+      "result": "PASS"
+    },
+    {
+      "host": "80.5.27.240",
+      "result": "PASS"
+    },
+    {
+      "host": "80.5.27.69",
+      "result": "PASS"
+    },
+    {
+      "host": "80.5.27.70",
+      "result": "PASS"
+    },
+    {
+      "host": "80.5.27.71",
+      "result": "PASS"
+    },
+    {
+      "host": "80.5.27.73",
+      "result": "PASS"
+    },
+    {
+      "host": "80.5.27.74",
+      "result": "PASS"
+    },
+    {
+      "host": "80.5.27.75",
+      "result": "PASS"
+    },
+    {
+      "host": "80.5.27.76",
+      "result": "PASS"
+    },
+    {
+      "host": "80.5.27.77",
+      "result": "PASS"
+    }
+  ],
+  "native_checks": [
+    {
+      "host": "80.5.27.69",
+      "rc": 0,
+      "out": "NATIVE ARGUMENTS PASS; visible=0,1,2,3,4,5,6,7; NPU not initialized\n",
+      "err": ""
+    },
+    {
+      "host": "80.5.27.237",
+      "rc": 0,
+      "out": "NATIVE ARGUMENTS PASS; visible=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15; NPU not initialized\n",
+      "err": ""
+    },
+    {
+      "host": "80.5.27.70",
+      "rc": 0,
+      "out": "NATIVE ARGUMENTS PASS; visible=0,1,2,3,4,5,6,7; NPU not initialized\n",
+      "err": ""
+    },
+    {
+      "host": "80.5.27.73",
+      "rc": 0,
+      "out": "NATIVE ARGUMENTS PASS; visible=0,1,2,3,4,5,6,7; NPU not initialized\n",
+      "err": ""
+    },
+    {
+      "host": "80.5.27.75",
+      "rc": 0,
+      "out": "NATIVE ARGUMENTS PASS; visible=0,1,2,3,4,5,6,7; NPU not initialized\n",
+      "err": ""
+    },
+    {
+      "host": "80.5.27.77",
+      "rc": 0,
+      "out": "NATIVE ARGUMENTS PASS; visible=0,1,2,3,4,5,6,7; NPU not initialized\n",
+      "err": ""
+    }
+  ],
+  "idle_gate_checks": [
+    {
+      "host": "80.5.27.237",
+      "rc": 0,
+      "out": "IDLE_GATE_PASS 80.5.27.237 visible=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 physical=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15\n",
+      "err": ""
+    },
+    {
+      "host": "80.5.27.69",
+      "rc": 0,
+      "out": "IDLE_GATE_PASS 80.5.27.69 visible=0,1,2,3,4,5,6,7 physical=0,1,2,3,4,5,6,7\n",
+      "err": ""
+    },
+    {
+      "host": "80.5.27.70",
+      "rc": 0,
+      "out": "IDLE_GATE_PASS 80.5.27.70 visible=0,1,2,3,4,5,6,7 physical=8,9,10,11,12,13,14,15\n",
+      "err": ""
+    }
+  ],
+  "port_regression": {
+    "original_collision_reproduced": true,
+    "mixed_node_fixed": true,
+    "uniform_behavior_unchanged": true
+  },
+  "corrected_device_mapping": "Upper-half physical /dev/davinci8..15 uses ACL/Ray logical IDs 0..7",
+  "framework_source_backup": "runtime/glm53-full128-engine_group.before-c26697de.py",
+  "validation_scope": {
+    "ray_cluster_started": false,
+    "hccl_test_run": false,
+    "model_loaded": false,
+    "training_started": false
+  },
+  "remaining": "Validate live 128-die HCCL, model initialization, optimizer step and step-after-offload recovery when actually launched"
+}
