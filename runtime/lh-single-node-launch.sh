@@ -3,8 +3,11 @@
 export TORCH_DEVICE_BACKEND_AUTOLOAD FLA_NPU_DISABLE_PTH PYTHONNOUSERSITE
 unset PYTHONPATH LD_LIBRARY_PATH LD_PRELOAD ASCEND_CUSTOM_OPP_PATH ASCEND_OPP_PATH ASCEND_AICPU_PATH ASCEND_HOME_PATH ASCEND_TOOLKIT_HOME ASCEND_CANN_PACKAGE_PATH ASCEND_HOME ASCEND_ATB_HOME ATB_HOME_PATH ASDSIP_HOME_PATH
 set +u
-source "$DEPS_ROOT/activate.sh"
+source "${GLM53_ACTIVATE_SCRIPT:-$DEPS_ROOT/activate.sh}"
 source "$FLA_PYTHON_ROOT/fla_npu/opp/vendors/fla_npu_transformer/bin/set_env.bash"
+if [[ ${GLM53_LOGP_PARITY_ONLY:-0} == 1 ]]; then
+    source "$(cat "$GLM53_BI_DEPS/vendor-env.path")"
+fi
 # FLA 26.10 embeds Conv1d. Registering the legacy private vendor first
 # mixes its kernels with the new op_api and fails workspace creation (561002).
 set -u
@@ -30,8 +33,12 @@ export ASCEND_HOME_PATH
 export PATH="$CONDA_ENV/bin:$PATH"
 export CONDA_PREFIX="$CONDA_ENV"
 export LD_LIBRARY_PATH="$CONDA_ENV/lib:${LD_LIBRARY_PATH:-}"
-export PYTHONPATH="$DEPS_ROOT/slime-ascend/scripts/lib/glm53/runtime:$SLIME_ROOT:$DEPS_ROOT/Megatron-LM:$DEPS_ROOT/MegatronAdaptor:$DEPS_ROOT/TransformerEngineNPU:$DEPS_ROOT/Megatron-Bridge/src:$DEPS_ROOT/sglang/python:${PYTHONPATH:-}"
+export PYTHONPATH="$DEPS_ROOT/slime-ascend/scripts/lib/glm53/runtime:$SLIME_ROOT:$DEPS_ROOT/Megatron-LM:$DEPS_ROOT/MegatronAdaptor:$DEPS_ROOT/TransformerEngineNPU:${GLM53_MEGATRON_BRIDGE_ROOT:-$DEPS_ROOT/Megatron-Bridge/src}:${SGLANG_PYTHONPATH:-$DEPS_ROOT/sglang/python}:${PYTHONPATH:-}"
 export GLM53_NATIVE_ROOT="$DEPS_ROOT"
+if [[ ${GLM53_LOGP_PARITY_ONLY:-0} == 1 ]]; then
+    export PYTHONPATH="$GLM53_RUNTIME_DIR/../scripts/lib/glm53/parity:$GLM53_BI_DEPS/python:$GLM53_RUNTIME_DIR/../scripts/lib/glm53/runtime:$PYTHONPATH"
+    export GLM53_NATIVE_HC_SHIM=1 SGLANG_NPU_HC_PRE_TAIL_GUARD=1
+fi
 # New native training workers use the validated CANN mHC path; torch remains an A/B override.
 export GLM53_MHC_BACKEND="${GLM53_MHC_BACKEND:-ascendc}"
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy RAY_ADDRESS
@@ -78,6 +85,15 @@ PY_CHECK
     exec 9>"/tmp/glm53-lh-$UID/single-node.lock"
     flock -n 9 || { echo 'Another lh single-node run holds the lock'; return 75; }
     npu-smi info > "$RUN_DIR/npu-before.txt"
+    if [[ ${GLM53_LOGP_PARITY_ONLY:-0} == 1 ]]; then
+        if [[ $(grep -c 'No running processes' "$RUN_DIR/npu-before.txt") -ne "$GLM53_NUM_NPUS" ]]; then
+            echo 'The eight-card parity recipe requires all eight NPUs to be free' >&2
+            return 75
+        fi
+        export GLM53_PARITY_REPORT_DIR="$RUN_DIR"
+        export GLM53_BATCH_REPORT="$RUN_DIR/batch-invariance.json"
+        export GLM53_TRACE_DIR="$RUN_DIR"
+    fi
     export TMPDIR=$(mktemp -d /tmp/g53lh.XXXXXX)
     export RAY_TMPDIR="$TMPDIR/ray" TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$RUN_DIR/triton}" TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$RUN_DIR/torch-extensions}"
     export HF_MODULES_CACHE="$RUN_DIR/hf_modules"

@@ -32,10 +32,10 @@ FLA_NPU_DISABLE_PTH=1
 PYTHONNOUSERSITE=1
 GLM53_NUM_NPUS=${GLM53_NUM_NPUS:-8}
 ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
-DEPS_ROOT=/mnt/share/l00937981/glm_53_flash_slime
-CONDA_ENV=/mnt/share/l00937981/conda/envs/glm53-flash-slime
-SLIME_ROOT=/mnt/share/l00937981/glm_53_flash_slime/slime-ascend/slime
-CANN_ROOT=/mnt/share/l00804615/cann/9.2.0/cann-9.2.0
+DEPS_ROOT=${DEPS_ROOT:-/mnt/share/l00937981/glm_53_flash_slime}
+CONDA_ENV=${CONDA_ENV:-/mnt/share/l00937981/conda/envs/glm53-flash-slime}
+SLIME_ROOT=${SLIME_ROOT:-/mnt/share/l00937981/glm_53_flash_slime/slime-ascend/slime}
+CANN_ROOT=${CANN_ROOT:-/mnt/share/l00804615/cann/9.2.0/cann-9.2.0}
 
 # Paths, interfaces, ports and explicit local overrides come from this machine.
 source "${GLM53_RUNTIME_DIR}/host.env"
