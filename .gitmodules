@@ -1,4 +1,4 @@
 [submodule "slime"]
 	path = slime
-	url = https://github.com/lihanwen7/slime-glm53-npu.git
-	branch = main
+	url = https://github.com/RuiningWANG/slime.git
+	branch = 4L_train_rollout

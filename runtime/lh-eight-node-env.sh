@@ -8,7 +8,6 @@ GLM53_EIGHT_COMMON_ENV=(
     RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1  # Slime assigns NPU IDs.
     RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0          # Keep IDs for zero-GPU Ray actors.
     USE_LIBUV=0                                  # TCPStore: keep the legacy backend.
-    SLIME_DESTROY_WORLD_PROCESS_GROUP=0           # Preserve WORLD across NPU offload/reload cycles.
     HCCL_BUFFSIZE=256                            # HCCL communicator buffer, MiB.
     HCCL_HOST_SOCKET_PORT_RANGE=9000-9099          # Rollout host ports; train uses 9200.
     HCCL_NPU_SOCKET_PORT_RANGE=9100-9199           # Rollout NPU ports; train uses 9300.

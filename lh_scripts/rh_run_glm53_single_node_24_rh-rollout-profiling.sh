@@ -5,7 +5,7 @@
 # (MegatronTrainRayActor.init returns immediately), so the NPUs are used by the
 # SGLang engine alone. Runs NUM_ROLLOUT rollout steps and exits.
 #
-# Parallel: SGLang TP=16 / EP=1 / DP=1 -> one engine spanning all 16 NPUs.
+# Parallel: SGLang TP=8 / EP=1 / DP=1 -> one engine spanning all 8 NPUs.
 # The actor's TP/PP/EP below are kept consistent but are never instantiated.
 #
 # Fixed-length workload: the prompt set is one sample repeated 200x and the
@@ -39,7 +39,7 @@ fi
 ray stop -f
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-LOG_ROOT=/mnt/share/l00937981/glm_53_flash_slime/start/logs/
+LOG_ROOT=${LOG_ROOT:-/mnt/share/l00937981/glm_53_flash_slime/start/logs/}
 
 # RAY_NODE_IP must exist before lh-ascend-runtime.sh is sourced (it exports
 # no_proxy with this value). COMM_IFNAME lives in runtime/host.env.
@@ -53,10 +53,10 @@ else
 fi
 [[ -n $RAY_NODE_IP ]] || { echo "No IPv4 address on $COMM_IFNAME" >&2; exit 2; }
 
-# This box (A3) has 16 NPUs. Must be set before lh-ascend-runtime.sh, which
-# otherwise defaults to 8 devices / 8 Ray NPU resources.
-GLM53_NUM_NPUS=16
-export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
+# Single 8-NPU node. Keep GLM53_NUM_NPUS and the visible device list in sync
+# with the single-node runtime's 8 Ray NPU resources.
+GLM53_NUM_NPUS=8
+export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 
 # The public CANN package eagerly builds several extensions. Cache those
 # builds before Ray starts so they do not run while a pipeline peer is waiting
@@ -73,15 +73,16 @@ if [[ ! -d /sys/class/net/$HCCL_SOCKET_IFNAME ]]; then
     export HCCL_SOCKET_IFNAME=$GLOO_SOCKET_IFNAME
 fi
 
-# Full-size checkpoint: 288 routed experts (599 GB on disk). The previous
-# top16 SFT checkpoint lives at
-#   /mnt/share/r30009656/code_project/GML5-3_s-b/start/CKPT/Geo3k/glm53_geo3k_sft-2/iter_0000400_bf16
-HF_CHECKPOINT=/mnt/share/r30009656/code_project/GML5-3_s-b/GLM-5.3-Flash-BF16
+# Full-size checkpoint: 288 routed experts (599 GB on disk).
+# Do NOT use the top16/top32 SFT checkpoints here; this recipe must use the
+# full-size 288-expert weights.
+HF_CHECKPOINT=${HF_CHECKPOINT:-/mnt/weight/GLM-5.3-Flash-BF16}
 # Fixed-length rollout prompt set: the first sample of repeat_64x4096 copied 200x
 # (dapo_4k_first_prompt_x200.jsonl, built 2026-11-10, sha256 in the .manifest.json).
-# The prompt string is ALREADY chat-templated ([gMASK]<sop>...<|assistant|><think>),
-# so --apply-chat-template must stay OFF or the template would be applied twice.
-PROMPT_DATA=/mnt/share/r30009656/code_project/GML5-3_s-b/glm53_32k_n1024/dataset/dapo_4k_first_prompt_x200.jsonl
+# The prompt is an OpenAI message list (source row 0), so the GLM template
+# must be applied via --apply-chat-template.
+# PROMPT_DATA=${PROMPT_DATA:-/mnt/share/r30009656/code_project/GML5-3_s-b/glm53_32k_n1024/dataset/dapo_4k_first_prompt_x200.jsonl}
+PROMPT_DATA=${PROMPT_DATA:-/mnt/share/l00804615/glm5.3_flash_native/cache/work/20261112_perf_4k_200/dapo_4k_first_prompt_x200.jsonl}
 EXPERIMENT_NAME=glm53
 # Save each rollout for later --load-debug-rollout-data training replay.
 # A separate directory per launch avoids overwriting previous runs.
@@ -98,6 +99,12 @@ ROLLOUT_MAX_RESPONSE_LEN=4096
 # Prompt limit includes the chat template (the templated prompt is 161 tokens).
 ROLLOUT_MAX_PROMPT_LEN=1024
 MAX_CONTEXT_LEN=16384
+
+# 8-card memory knobs. Raise the static fraction if KV cache is too small;
+# lower it if activation/workspace allocation OOMs. Lower max-running-requests
+# if SGLang reports KV-cache OOM at 32 concurrent 4k requests.
+SGLANG_MEM_FRACTION_STATIC=${SGLANG_MEM_FRACTION_STATIC:-0.88}
+SGLANG_MAX_RUNNING_REQUESTS=${SGLANG_MAX_RUNNING_REQUESTS:-32}
 
 # ---- Training profiling (opt-in) ---------------------------------------------
 # Profiles the Megatron train steps (forward/backward/optimizer) with
@@ -213,14 +220,15 @@ PY_CHUNKS
 
 # Rollout, optimizer, parallelism and SGLang settings.
 ARGS=(
-    --actor-num-nodes 1 --actor-num-gpus-per-node 16 --num-gpus-per-node 16 --colocate
+    --actor-num-nodes 1 --actor-num-gpus-per-node 8 --num-gpus-per-node 8 --colocate
     # Rollout-only run: the actor is never built, so keep the engine resident
     # (--colocate would otherwise enable the SGLang memory-saver offload).
     --no-offload-train --no-offload-rollout
     --train-env-vars "$TRAIN_ENV_JSON"
     "${MODEL_ARGS[@]}"
     --hf-checkpoint "$HF_CHECKPOINT" --load "$HF_CHECKPOINT" --megatron-to-hf-mode raw
-    # No --apply-chat-template: PROMPT_DATA is already templated.
+    # PROMPT_DATA is an OpenAI message list; render it with the GLM chat template.
+    --apply-chat-template
     --prompt-data "$PROMPT_DATA" --input-key prompt --label-key label
     --rm-type "${RM_TYPE:-deepscaler}" --seed 522
     # 200 identical prompts x 1 sample = 200 fixed-length 4k generations per rollout.
@@ -230,11 +238,11 @@ ARGS=(
     --rollout-max-response-len "$ROLLOUT_MAX_RESPONSE_LEN" --rollout-temperature 1 --rollout-top-p 1
     --rollout-max-prompt-len "$ROLLOUT_MAX_PROMPT_LEN" --rollout-max-context-len "$MAX_CONTEXT_LEN"
     --advantage-estimator grpo --pg-loss-type reinforce
-    # TP=16 x PP=1 -> DP=1. Only the SGLang engine is instantiated in this
+    # TP=8 x PP=1 -> DP=1. Only the SGLang engine is instantiated in this
     # rollout-only recipe; these stay consistent for the (skipped) actor.
     # PP=1 means all 45 layers on one rank, so the uneven-pipeline
     # --decoder-first/last-pipeline-num-layers knobs must NOT be set.
-    --tensor-model-parallel-size 16 --pipeline-model-parallel-size 1
+    --tensor-model-parallel-size 8 --pipeline-model-parallel-size 1
     --context-parallel-size "${CP_SIZE:-1}" --expert-model-parallel-size 1 --expert-tensor-parallel-size 1
     --allgather-cp --moe-token-dispatcher-type alltoall
     --recompute-granularity full --recompute-method uniform --recompute-num-layers 1
@@ -250,14 +258,15 @@ ARGS=(
     # enabled: slime calls DDP.disable_forward_pre_hook() at the start of every
     # rollout, and the second call raises KeyError on the already-removed handles.
     --overlap-grad-reduce
-    # One engine across all 16 NPUs: TP=16 / DP=1 / EP=1.
-    --rollout-num-gpus-per-engine 16
-    --sglang-device npu --sglang-attention-backend ascend --sglang-tp-size 16
+    # One engine across all 8 NPUs: TP=8 / DP=1 / EP=1.
+    --rollout-num-gpus-per-engine 8
+    --sglang-device npu --sglang-attention-backend ascend --sglang-tp-size 8
     --sglang-dp-size 1 --sglang-ep-size 1
-    # Full-size weights are ~599 GB / 16 ranks = ~37 GB per card, so the static
-    # budget must sit well above that (0.55 x 61 GB = 34 GB would not fit).
-    --sglang-mem-fraction-static 0.65 --sglang-context-length "$MAX_CONTEXT_LEN"
-    --sglang-max-running-requests 32 --sglang-chunked-prefill-size 1024
+    # Full-size weights are ~599 GB / 8 ranks = ~75 GB per card. This needs
+    # 96 GB HBM per NPU; on 64 GB cards the full-size checkpoint cannot fit.
+    # 0.88 x 96 GB = 84.5 GB static budget leaves ~9.5 GB for KV/activation.
+    --sglang-mem-fraction-static "$SGLANG_MEM_FRACTION_STATIC" --sglang-context-length "$MAX_CONTEXT_LEN"
+    --sglang-max-running-requests "$SGLANG_MAX_RUNNING_REQUESTS" --sglang-chunked-prefill-size 1024
     --sglang-disable-overlap-schedule --sglang-cuda-graph-bs 1 2 4 8 16 24 32
     --sglang-page-size 64 --sglang-kv-cache-dtype bfloat16 --sglang-watchdog-timeout 1200
     --attention-dropout 0 --hidden-dropout 0 --bf16

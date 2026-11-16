@@ -6,17 +6,18 @@
 set -euo pipefail
 
 # Fusion backends must be exported so the Ray runtime env (and actor) inherits them.
-export GLM53_KPOOL_BACKEND=${GLM53_KPOOL_BACKEND:-ascendc}
-export GLM53_MHC_BACKEND=${GLM53_MHC_BACKEND:-ascendc}
-export GLM53_SWIGLU_BACKEND=ascendc
+export GLM53_MHC_BACKEND=ascendc
 export GLM53_CONV_BACKEND=ascendc
+export GLM53_KPOOL_BACKEND=${GLM53_KPOOL_BACKEND:-ascendc}
+export GLM53_SWIGLU_BACKEND=ascendc
 
 export GLM53_KDA_SEQUENCE_MODE=packed
 export GLM53_KDA_FWD_HEAD_CHUNK_SIZE=64
 export GLM53_KDA_BWD_HEAD_CHUNK_SIZE=64
 
 # Replay the same saved batch for 10 training steps by default.
-LOAD_DEBUG_ROLLOUT_DATA=${LOAD_DEBUG_ROLLOUT_DATA-/mnt/share/l00804615/glm5.3_flash_native/cache/work/20261029_115048_node25_rollout_once_retry/rollouts/rollout-0-response8192-64samples.pt}
+# LOAD_DEBUG_ROLLOUT_DATA=${LOAD_DEBUG_ROLLOUT_DATA-/mnt/share/l00804615/glm5.3_flash_native/cache/work/20261029_115048_node25_rollout_once_retry/rollouts/rollout-0-response8192-64samples.pt}
+LOAD_DEBUG_ROLLOUT_DATA=${LOAD_DEBUG_ROLLOUT_DATA-/mnt/share/l00804615/glm5.3_flash_native/cache/work/20261030_214729_rh24_rollout_1087987/rollout-0.pt}
 NUM_ROLLOUT=${NUM_ROLLOUT:-10}
 ROLLOUT_ONLY=${ROLLOUT_ONLY:-0}
 
@@ -38,7 +39,8 @@ RAY_NODE_IP=$(ip -o -4 addr show dev "$COMM_IFNAME" | awk '{print $4}' | cut -d/
 
 source "${SCRIPT_DIR}/../runtime/lh-ascend-runtime.sh"
 
-HF_CHECKPOINT=/mnt/share/l00937981/iter_0003000_bf16
+# HF_CHECKPOINT=/mnt/share/l00937981/iter_0003000_bf16
+HF_CHECKPOINT=/mnt/weight/GLM-5.3-Flash-BF16-top32
 PROMPT_DATA=/mnt/share/l00937981/glm53_dapo_sft_rl.jsonl
 EXPERIMENT_NAME=glm53
 # Save each rollout for later --load-debug-rollout-data training replay.
@@ -108,7 +110,7 @@ MODEL_ARGS=(
     --normalization RMSNorm
     --norm-epsilon 1e-5
     --rotary-base 800000
-    --num-experts 16
+    --num-experts 32
     --moe-layer-freq '[0]*3+[1]*42'
     --moe-ffn-hidden-size 2048
     --moe-shared-expert-intermediate-size 2048
@@ -184,12 +186,12 @@ ARGS=(
     --tensor-model-parallel-size 1 --pipeline-model-parallel-size 4
     # 45
     --decoder-first-pipeline-num-layers 12 --decoder-last-pipeline-num-layers 11
-    --context-parallel-size "${CP_SIZE:-1}" --expert-model-parallel-size 1 --expert-tensor-parallel-size 1
+    --context-parallel-size "${CP_SIZE:-1}" --expert-model-parallel-size 2 --expert-tensor-parallel-size 1
     --allgather-cp --moe-token-dispatcher-type alltoall
     --recompute-granularity full --recompute-method uniform --recompute-num-layers 1
     --seq-length "$MAX_CONTEXT_LEN" --max-position-embeddings "$MAX_CONTEXT_LEN"
     # Packing budget only: an oversized individual sample is scheduled alone.
-    --use-dynamic-batch-size --max-tokens-per-gpu 8192 --data-pad-size-multiplier 1024
+    --use-dynamic-batch-size --max-tokens-per-gpu 4096 --data-pad-size-multiplier 1024
     --log-probs-chunk-size 1024
     --optimizer adam --lr 1e-6 --lr-decay-style constant --weight-decay 0.1 --adam-beta1 0.9 --adam-beta2 0.98
     --no-load-optim --no-load-rng --no-save-optim --freeze-params-name-list 'model.visual.*'
@@ -210,7 +212,7 @@ ARGS=(
     --accumulate-allreduce-grads-in-fp32 --attention-softmax-in-fp32
     --distributed-timeout-minutes 20 --update-weight-buffer-size 268435456
     --rollout-data-transport object-store
-    --save-debug-rollout-data "$SAVE_DEBUG_ROLLOUT_DATA"
+    # --save-debug-rollout-data "$SAVE_DEBUG_ROLLOUT_DATA"
     --use-rollout-routing-replay
 )
 

@@ -1,5 +1,5 @@
 # Source this file to activate Conda and the required Ascend SDKs.
-source /opt/miniconda3/etc/profile.d/conda.sh || return
+source /root/miniconda3/etc/profile.d/conda.sh || return
 conda activate /mnt/share/l00804615/conda/envs/lhw_glm_53_flash_native || return
 source /mnt/share/l00804615/cann/9.2.0/cann-9.2.0/set_env.sh || return
 source /mnt/share/l00804615/cann/9.2.0/nnal/atb/set_env.sh || return

@@ -23,8 +23,9 @@ def identity(pid):
         root = Path('/proc') / str(pid)
         raw = (root / 'stat').read_text()
         rest = raw[raw.rfind(')') + 2:].split()
+        argv = [part.decode(errors='replace') for part in (root / 'cmdline').read_bytes().split(b'\0') if part]
         return {'pid': pid, 'ticks': rest[19], 'ppid': int(rest[1]), 'state': rest[0],
-                'cmd': (root / 'cmdline').read_bytes().replace(b'\0', b' ').decode(errors='replace')}
+                'argv': argv, 'cmd': ' '.join(argv)}
     except (OSError, ValueError, IndexError):
         return None
 
@@ -52,6 +53,36 @@ def processes():
             if row is not None and row['state'] != 'Z':
                 result[row['pid']] = row
     return result
+
+
+
+def is_compute_process(row, markers):
+    argv = row.get('argv', [])
+    if not argv:
+        return False
+    executable = Path(argv[0]).name
+    entrypoint = argv[0]
+    entrypoint_index = 0
+    if executable.startswith('python') or executable in ('bash', 'sh', 'dash', 'zsh'):
+        # Inline source is data, not the executable or module being selected.
+        if '-c' in argv:
+            return False
+        if '-m' in argv:
+            index = argv.index('-m') + 1
+            entrypoint_index = index
+            entrypoint = argv[index] if index < len(argv) else ''
+        else:
+            entrypoint_index = next((i for i in range(1, len(argv)) if not argv[i].startswith('-')), len(argv))
+            entrypoint = argv[entrypoint_index] if entrypoint_index < len(argv) else ''
+    command = Path(entrypoint).name
+    command_args = argv[entrypoint_index + 1:]
+    if command in ('raylet', 'gcs_server', 'torchrun'):
+        return True
+    if command == 'ray':
+        return bool(command_args) and command_args[0] == 'start'
+    if command == 'vllm':
+        return bool(command_args) and command_args[0] == 'serve'
+    return any(marker in entrypoint for marker in markers)
 
 
 def npu_snapshot():
@@ -111,6 +142,7 @@ def main():
     parser.add_argument('--protocol', required=True, type=Path)
     parser.add_argument('--node', required=True, type=int)
     parser.add_argument('--remaining-seconds', required=True, type=float)
+    parser.add_argument('--adopt-existing', action='store_true')
     args = parser.parse_args()
     cfg = json.loads(args.protocol.read_text())
     root = args.protocol.parent
@@ -128,6 +160,7 @@ def main():
     remaining = min(args.remaining_seconds, cfg['deadline_epoch'] - time.time())
     deadline = time.monotonic() + max(0, remaining)
     stop_at = deadline - cfg.get('cleanup_lead_seconds', 90)
+    previous = json.loads((node / 'state.json').read_text()) if args.adopt_existing else None
     me = identity(os.getpid())
     write_json(node / 'guard-identity.json', dict(me, owner=owner, boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
                                                 deadline_local_epoch=cfg['deadline_epoch']))
@@ -148,6 +181,16 @@ def main():
     markers = tuple(cfg['compute_markers'])
     ownership_marker = ('GLM53_EXCLUSIVE_OWNER=' + owner).encode()
     terminate = False
+    if previous is not None:
+        # A replacement guard adopts live identities without relaunching their job.
+        saved = json.loads((node / 'owned-identities.json').read_text())
+        for row in saved:
+            if row['pid'] != previous['guard']['pid'] and alive(row):
+                own[row['pid']] = row
+        launched.update(previous.get('launched', []))
+        active_attempt = previous.get('active_attempt')
+        candidate_child = previous.get('child')
+        child_row = candidate_child if candidate_child and alive(candidate_child) else None
 
     def requested_stop(signum, frame):
         nonlocal terminate
@@ -213,7 +256,7 @@ def main():
                 write_json(root / ('emergency-node' + str(args.node) + '.json'), sample)
         if now >= next_foreign_scan and now < stop_at:
             next_foreign_scan = now + 2
-            foreign = {pid: row for pid, row in rows.items() if pid not in current_own and any(m in row['cmd'] for m in markers)}
+            foreign = {pid: row for pid, row in rows.items() if pid not in current_own and is_compute_process(row, markers)}
             for entry in last_npu.get('processes', []):
                 pid = entry['pid']
                 if pid in rows and pid not in current_own and rows[pid]['ticks'] == entry.get('ticks'):
@@ -244,7 +287,7 @@ def main():
             request = json.loads((root / 'launch.json').read_text())
             attempt = request['run_id']
             if attempt not in launched:
-                if child is None or (child.poll() is not None and len(current_own) == 1):
+                if (child is None or child.poll() is not None) and (child_row is None or not alive(child_row)) and len(current_own) == 1:
                     launched.add(attempt)
                     active_attempt = attempt
                     launch_env = dict(os.environ, **request.get('env', {}))
@@ -256,7 +299,7 @@ def main():
                     own[child.pid] = child_row
                     write_json(node / 'launch-identity.json', dict(child_row, attempt=attempt))
                     event('launch', attempt=attempt, identity=child_row)
-        child_code = child.poll() if child is not None else None
+        child_code = child.poll() if child is not None else (-1 if child_row is not None and not alive(child_row) else None)
         write_json(node / 'state.json', {'epoch': time.time(), 'owner': owner,
                    'guard': me, 'stopping': stopping, 'shutdown_reason': shutdown_reason,
                    'active_attempt': active_attempt, 'retiring': retiring,

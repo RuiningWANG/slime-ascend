@@ -1,7 +1,29 @@
 #!/usr/bin/env bash
 # GLM-5.3-Flash, native single-node recipe. Edit the parameters below.
+# Training-only variant: replay one saved rollout for training.
 # --check performs static validation; a normal launch retains exclusive resource gates.
 set -euo pipefail
+
+# Fusion backends must be exported so the Ray runtime env (and actor) inherits them.
+export GLM53_MHC_BACKEND=ascendc
+export GLM53_CONV_BACKEND=ascendc
+export GLM53_KPOOL_BACKEND=${GLM53_KPOOL_BACKEND:-ascendc}
+export GLM53_SWIGLU_BACKEND=torch
+
+export GLM53_KDA_SEQUENCE_MODE=packed
+export GLM53_KDA_FWD_HEAD_CHUNK_SIZE=64
+export GLM53_KDA_BWD_HEAD_CHUNK_SIZE=64
+
+# Replay the same saved batch for 10 training steps by default.
+# LOAD_DEBUG_ROLLOUT_DATA=${LOAD_DEBUG_ROLLOUT_DATA-/mnt/share/l00804615/glm5.3_flash_native/cache/work/20261029_115048_node25_rollout_once_retry/rollouts/rollout-0-response8192-64samples.pt}
+LOAD_DEBUG_ROLLOUT_DATA=${LOAD_DEBUG_ROLLOUT_DATA-/mnt/share/l00804615/glm5.3_flash_native/cache/work/20261030_214729_rh24_rollout_1087987/rollout-0.pt}
+NUM_ROLLOUT=${NUM_ROLLOUT:-10}
+ROLLOUT_ONLY=${ROLLOUT_ONLY:-0}
+
+if [[ -n "${LOAD_DEBUG_ROLLOUT_DATA:-}" && "${ROLLOUT_ONLY:-0}" == "1" ]]; then
+    echo "LOAD_DEBUG_ROLLOUT_DATA and ROLLOUT_ONLY=1 are mutually exclusive" >&2
+    exit 2
+fi
 
 ray stop -f
 
@@ -19,7 +41,6 @@ source "${SCRIPT_DIR}/../runtime/lh-ascend-runtime.sh"
 HF_CHECKPOINT=/mnt/share/l00937981/iter_0003000_bf16
 PROMPT_DATA=/mnt/share/l00937981/glm53_dapo_sft_rl.jsonl
 EXPERIMENT_NAME=glm53
-NUM_ROLLOUT=${NUM_ROLLOUT:-10}
 # Save each rollout for later --load-debug-rollout-data training replay.
 # A separate directory per launch avoids overwriting previous runs.
 ROLLOUT_SAVE_DIR=${ROLLOUT_SAVE_DIR:-/mnt/share/l00804615/glm5.3_flash_native/cache/work/$(date +%Y%m%d_%H%M%S)_rh24_rollout_$$}
@@ -32,24 +53,6 @@ CP_SIZE=1
 ROLLOUT_MAX_RESPONSE_LEN=8192
 ROLLOUT_MAX_PROMPT_LEN=1024
 MAX_CONTEXT_LEN=16384
-
-# ---- Training profiling (opt-in) ---------------------------------------------
-# Profiles the Megatron train steps (forward/backward/optimizer) with
-# torch_npu.profiler via the slime before-train-step hook. Disabled by default.
-# Steps are GLOBAL training-step indices (0-based, same as "train/step" in the
-# logs; this recipe has 1 train step per rollout).
-#   PROFILE=1 bash rh_run_glm53_single_node_24_rh.sh
-#   PROFILE=1 PROFILE_STEP_START=3 PROFILE_STEP_END=3 PROFILE_RANKS=0,1 ...
-# Hook module: scripts/lib/glm53/runtime/glm53_train_profiler.py
-# Output: $GLM53_PROFILE_DIR/trainstep<S>-<E>/rank<N>/*_ascend_pt/ASCEND_PROFILER_OUTPUT/
-GLM53_PROFILE_TRAIN=${GLM53_PROFILE_TRAIN:-${PROFILE:-0}}
-GLM53_PROFILE_DIR=${GLM53_PROFILE_DIR:-/mnt/share/l00804615/glm5.3_flash_native/start/glm53-profiles-stack}
-GLM53_PROFILE_STEP_START=${GLM53_PROFILE_STEP_START:-${PROFILE_STEP_START:-3}}
-GLM53_PROFILE_STEP_END=${GLM53_PROFILE_STEP_END:-${PROFILE_STEP_END:-3}}
-GLM53_PROFILE_RANKS=${GLM53_PROFILE_RANKS:-${PROFILE_RANKS:-0}}
-GLM53_PROFILE_LEVEL=${GLM53_PROFILE_LEVEL:-${PROFILE_LEVEL:-Level1}}
-GLM53_PROFILE_AIC=${GLM53_PROFILE_AIC:-${PROFILE_AIC:-AiCoreNone}}
-GLM53_PROFILE_WITH_STACK=${GLM53_PROFILE_WITH_STACK:-${PROFILE_WITH_STACK:-0}}
 
 # Model architecture (top16 checkpoint).
 MODEL_ARGS=(
@@ -99,9 +102,6 @@ GLM53_EXPERT_TOKEN_CHUNK_SIZE=${GLM53_EXPERT_TOKEN_CHUNK_SIZE:-0}
 TRAIN_ENV_JSON=$(/usr/bin/python3 -I -S - \
     "$TRAIN_ENV_JSON" \
     "$GLM53_MOE_DISPATCH_CHUNK_SIZE" "$GLM53_EXPERT_TOKEN_CHUNK_SIZE" \
-    "$GLM53_PROFILE_TRAIN" "$GLM53_PROFILE_DIR" \
-    "$GLM53_PROFILE_STEP_START" "$GLM53_PROFILE_STEP_END" "$GLM53_PROFILE_RANKS" \
-    "$GLM53_PROFILE_LEVEL" "$GLM53_PROFILE_AIC" "$GLM53_PROFILE_WITH_STACK" \
     <<'PY_CHUNKS'
 import json
 import sys
@@ -110,13 +110,6 @@ for key, raw in zip(("GLM53_MOE_DISPATCH_CHUNK_SIZE", "GLM53_EXPERT_TOKEN_CHUNK_
     size = int(raw)
     assert size >= 0, key
     values[key] = str(size)
-profile_keys = (
-    "GLM53_PROFILE_TRAIN", "GLM53_PROFILE_DIR",
-    "GLM53_PROFILE_STEP_START", "GLM53_PROFILE_STEP_END", "GLM53_PROFILE_RANKS",
-    "GLM53_PROFILE_LEVEL", "GLM53_PROFILE_AIC", "GLM53_PROFILE_WITH_STACK",
-)
-for key, value in zip(profile_keys, sys.argv[4:]):
-    values[key] = value
 print(json.dumps(values))
 PY_CHUNKS
 )
@@ -124,6 +117,9 @@ PY_CHUNKS
 # Rollout, optimizer, parallelism and SGLang settings.
 ARGS=(
     --actor-num-nodes 1 --actor-num-gpus-per-node 8 --colocate
+    # Keep the training actor and rollout engine resident; --colocate otherwise
+    # enables both offloads. Safe for debug-replay (train-only) runs.
+    --no-offload-train --no-offload-rollout
     --train-env-vars "$TRAIN_ENV_JSON"
     "${MODEL_ARGS[@]}"
     --hf-checkpoint "$HF_CHECKPOINT" --load "$HF_CHECKPOINT" --megatron-to-hf-mode raw
@@ -135,8 +131,9 @@ ARGS=(
     --rollout-max-prompt-len "$ROLLOUT_MAX_PROMPT_LEN" --rollout-max-context-len "$MAX_CONTEXT_LEN"
     --advantage-estimator grpo --pg-loss-type reinforce
     --tensor-model-parallel-size 1 --pipeline-model-parallel-size 4
+    # 45
     --decoder-first-pipeline-num-layers 12 --decoder-last-pipeline-num-layers 11
-    --context-parallel-size "${CP_SIZE:-1}" --expert-model-parallel-size 2 --expert-tensor-parallel-size 1
+    --context-parallel-size "${CP_SIZE:-1}" --expert-model-parallel-size 1 --expert-tensor-parallel-size 1
     --allgather-cp --moe-token-dispatcher-type alltoall
     --recompute-granularity full --recompute-method uniform --recompute-num-layers 1
     --seq-length "$MAX_CONTEXT_LEN" --max-position-embeddings "$MAX_CONTEXT_LEN"
@@ -162,17 +159,14 @@ ARGS=(
     --accumulate-allreduce-grads-in-fp32 --attention-softmax-in-fp32
     --distributed-timeout-minutes 20 --update-weight-buffer-size 268435456
     --rollout-data-transport object-store
-    --save-debug-rollout-data "$SAVE_DEBUG_ROLLOUT_DATA"
+    # --save-debug-rollout-data "$SAVE_DEBUG_ROLLOUT_DATA"
     --use-rollout-routing-replay
 )
 
-# Attach the profiling hook only when requested; normal runs stay untouched.
-if [[ "$GLM53_PROFILE_TRAIN" == "1" ]]; then
-    ARGS+=(--custom-megatron-before-train-step-hook-path glm53_train_profiler.before_train_step)
-fi
-
 # Optional rollout capture without initializing or training the actor model.
-if [[ "${ROLLOUT_ONLY:-0}" == "1" ]]; then
+if [[ -n "${LOAD_DEBUG_ROLLOUT_DATA:-}" ]]; then
+    ARGS+=(--load-debug-rollout-data "$LOAD_DEBUG_ROLLOUT_DATA")
+elif [[ "${ROLLOUT_ONLY:-0}" == "1" ]]; then
     ARGS+=(--debug-rollout-only)
 else
     # This check resets serving weights and requires the training actor to restore them.

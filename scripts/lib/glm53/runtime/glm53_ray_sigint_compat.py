@@ -67,11 +67,11 @@ def install():
     trace = os.environ.get('GLM53_RAY_SIGINT_TRACE') == '1'
     if not (normalize or trace):
         return
-    base = Path(__file__).resolve().parents[5]
+    base = Path('/mnt/share/l00804615/glm5.3_flash_native')
     if not Path.cwd().resolve().is_relative_to(base.resolve()):
         raise RuntimeError('SIGINT hook requires task-owned cwd')
-    if Path(os.environ.get('GLM53_NATIVE_ROOT', '')).resolve() != base:
-        raise RuntimeError('SIGINT hook project root mismatch')
+    if json.loads((base / '.native-owner.json').read_text()).get('owner') != 'glm53-native-20261019':
+        raise RuntimeError('SIGINT hook task owner mismatch')
     from ray._private.utils import DeferSigint
     _patch_class(DeferSigint, normalize)
     _emit('installed', normalize_entry_none=normalize,

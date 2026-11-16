@@ -8,15 +8,15 @@ set -euo pipefail
 # Fusion backends must be exported so the Ray runtime env (and actor) inherits them.
 export GLM53_KPOOL_BACKEND=${GLM53_KPOOL_BACKEND:-ascendc}
 export GLM53_MHC_BACKEND=${GLM53_MHC_BACKEND:-ascendc}
-export GLM53_SWIGLU_BACKEND=ascendc
+export GLM53_SWIGLU_BACKEND=torch
 export GLM53_CONV_BACKEND=ascendc
 
-# export GLM53_KDA_SEQUENCE_MODE=packed
-# export GLM53_KDA_FWD_HEAD_CHUNK_SIZE=64
-# export GLM53_KDA_BWD_HEAD_CHUNK_SIZE=64
+export GLM53_KDA_SEQUENCE_MODE=packed
+export GLM53_KDA_FWD_HEAD_CHUNK_SIZE=64
+export GLM53_KDA_BWD_HEAD_CHUNK_SIZE=64
 
-# Replay the same saved batch for 10 training steps by default.
-LOAD_DEBUG_ROLLOUT_DATA=${LOAD_DEBUG_ROLLOUT_DATA-/mnt/share/l00804615/glm5.3_flash_native/cache/work/20261029_115048_node25_rollout_once_retry/rollouts/rollout-0-response8192-64samples.pt}
+# End-to-end rollout: 200-prompt dataset from an 8k-response sample.
+# LOAD_DEBUG_ROLLOUT_DATA=""
 NUM_ROLLOUT=${NUM_ROLLOUT:-10}
 ROLLOUT_ONLY=${ROLLOUT_ONLY:-0}
 
@@ -39,7 +39,7 @@ RAY_NODE_IP=$(ip -o -4 addr show dev "$COMM_IFNAME" | awk '{print $4}' | cut -d/
 source "${SCRIPT_DIR}/../runtime/lh-ascend-runtime.sh"
 
 HF_CHECKPOINT=/mnt/share/l00937981/iter_0003000_bf16
-PROMPT_DATA=/mnt/share/l00937981/glm53_dapo_sft_rl.jsonl
+PROMPT_DATA=/mnt/share/l00804615/glm5.3_flash_native/cache/work/20261106_perf_8k_200/prompt-8k-source0-200.jsonl
 EXPERIMENT_NAME=glm53
 # Save each rollout for later --load-debug-rollout-data training replay.
 # A separate directory per launch avoids overwriting previous runs.
@@ -51,6 +51,7 @@ CP_SIZE=1
 
 # Prompt limit includes the chat template. Total context capacity includes prompt and response.
 ROLLOUT_MAX_RESPONSE_LEN=8192
+ROLLOUT_MIN_NEW_TOKENS=${ROLLOUT_MIN_NEW_TOKENS:-8192}
 ROLLOUT_MAX_PROMPT_LEN=1024
 MAX_CONTEXT_LEN=16384
 
@@ -170,7 +171,7 @@ ARGS=(
     --actor-num-nodes 1 --actor-num-gpus-per-node 8 --colocate
     # Keep the training actor and rollout engine resident; --colocate otherwise
     # enables both offloads. Safe for debug-replay (train-only) runs.
-    --no-offload-train --no-offload-rollout
+    # --no-offload-train --no-offload-rollout
     --train-env-vars "$TRAIN_ENV_JSON"
     "${MODEL_ARGS[@]}"
     --hf-checkpoint "$HF_CHECKPOINT" --load "$HF_CHECKPOINT" --megatron-to-hf-mode raw
@@ -179,11 +180,13 @@ ARGS=(
     --num-rollout "${NUM_ROLLOUT:-2}" --rollout-batch-size 8 --n-samples-per-prompt 8
     --global-batch-size 64 --micro-batch-size 1
     --rollout-max-response-len "$ROLLOUT_MAX_RESPONSE_LEN" --rollout-temperature 1 --rollout-top-p 1
+    --rollout-min-new-tokens "$ROLLOUT_MIN_NEW_TOKENS" --rollout-ignore-eos
     --rollout-max-prompt-len "$ROLLOUT_MAX_PROMPT_LEN" --rollout-max-context-len "$MAX_CONTEXT_LEN"
     --advantage-estimator grpo --pg-loss-type reinforce
     --tensor-model-parallel-size 1 --pipeline-model-parallel-size 4
+    # 45
     --decoder-first-pipeline-num-layers 12 --decoder-last-pipeline-num-layers 11
-    --context-parallel-size "${CP_SIZE:-1}" --expert-model-parallel-size 2 --expert-tensor-parallel-size 1
+    --context-parallel-size "${CP_SIZE:-1}" --expert-model-parallel-size 1 --expert-tensor-parallel-size 1
     --allgather-cp --moe-token-dispatcher-type alltoall
     --recompute-granularity full --recompute-method uniform --recompute-num-layers 1
     --seq-length "$MAX_CONTEXT_LEN" --max-position-embeddings "$MAX_CONTEXT_LEN"
@@ -209,7 +212,7 @@ ARGS=(
     --accumulate-allreduce-grads-in-fp32 --attention-softmax-in-fp32
     --distributed-timeout-minutes 20 --update-weight-buffer-size 268435456
     --rollout-data-transport object-store
-    --save-debug-rollout-data "$SAVE_DEBUG_ROLLOUT_DATA"
+    # --save-debug-rollout-data "$SAVE_DEBUG_ROLLOUT_DATA"
     --use-rollout-routing-replay
 )
 

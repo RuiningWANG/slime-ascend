@@ -15,44 +15,31 @@ export GLM53_KDA_BWD_HEAD_CHUNK_SIZE=${GLM53_KDA_BWD_HEAD_CHUNK_SIZE:-64}
 # CPU packed boundaries and ViT alignment use the model's existing implementation.
 
 # Ray address on this machine's communication NIC; change when moving hosts.
-RAY_NODE_IP=${RAY_NODE_IP:-172.27.2.125}
+RAY_NODE_IP=${RAY_NODE_IP:-197.13.38.1}
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-GLM53_NUM_NPUS=16
-export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
+export GLM53_4L_ROOT="$(dirname "$SCRIPT_DIR")"
 source "${SCRIPT_DIR}/../runtime/lh-ascend-runtime.sh"
-
 
 export HCCL_EXEC_TIMEOUT=3600 HCCL_CONNECT_TIMEOUT=3600 ACL_DEVICE_SYNC_TIMEOUT=3600
 
-HF_CHECKPOINT=/mnt/share/r30009656/code_project/GML5-3_s-b/start/CKPT/Geo3k/glm53_geo3k_sft-2/iter_0000400_bf16
-PROMPT_DATA=/mnt/share/r30009656/code_project/GML5-3_s-b/geo3k_dataset/geo3k_bench_519/geo3k_519_glm53_multimodal.jsonl
-EXPERIMENT_NAME=glm53_geo3k
-NUM_ROLLOUT=${NUM_ROLLOUT:-100}
-# Megatron checkpoints without optimizer/RNG state by default; rollout progress is retained.
-# Default: save at the final rollout (the trainer also saves at epoch boundaries).
-SAVE_INTERVAL=${SAVE_INTERVAL:-${NUM_ROLLOUT}}
-SAVE_DIR=${SAVE_DIR:-/mnt/share/l00937981/glm_53_flash_slime/cache/checkpoints/glm53_geo3k_$(date +%Y%m%d_%H%M%S)_$$}
-if [[ ! "$SAVE_INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
-    echo "SAVE_INTERVAL must be a positive integer" >&2
-    exit 2
-fi
-RM_TYPE=deepscaler
+HF_CHECKPOINT="$GLM53_4L_ROOT/GLM-5.3-Flash-BF16-4L"
+PROMPT_DATA="${PROMPT_DATA:-$GLM53_4L_ROOT/prompts-short.jsonl}"
+EXPERIMENT_NAME=glm53_bf16_4l
+NUM_ROLLOUT=${NUM_ROLLOUT:-2}
+RM_TYPE=math
 CP_SIZE=1
 
 # Prompt limit includes the chat template. Total context capacity includes prompt and response.
-ROLLOUT_MAX_RESPONSE_LEN=${ROLLOUT_MAX_RESPONSE_LEN:-2048}
-ROLLOUT_MAX_PROMPT_LEN=${ROLLOUT_MAX_PROMPT_LEN:-1024}
-MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN:-4096}
-ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-8}
-N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-8}
-GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))}
+ROLLOUT_MAX_RESPONSE_LEN=${ROLLOUT_MAX_RESPONSE_LEN:-24}
+ROLLOUT_MAX_PROMPT_LEN=${ROLLOUT_MAX_PROMPT_LEN:-256}
+MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN:-1024}
 
-# Model architecture (top16 checkpoint).
+# Four retained decoder layers and all original experts.
 MODEL_ARGS=(
     --spec slime_plugins.models.glm5_next.model get_glm5_next_model_provider
     --model-name glm5_next
-    --num-layers 45
+    --num-layers 4
     --hidden-size 4096
     --ffn-hidden-size 12288
     --num-attention-heads 64
@@ -69,8 +56,8 @@ MODEL_ARGS=(
     --normalization RMSNorm
     --norm-epsilon 1e-5
     --rotary-base 800000
-    --num-experts 16
-    --moe-layer-freq '[0]*3+[1]*42'
+    --num-experts 288
+    --moe-layer-freq '[0]*3+[1]'
     --moe-ffn-hidden-size 2048
     --moe-shared-expert-intermediate-size 2048
     --moe-router-topk 8
@@ -95,9 +82,6 @@ TRAIN_ENV_JSON=$(/usr/bin/python3 -I -S - "$TRAIN_ENV_JSON" "$GLM53_MOE_DISPATCH
 import json
 import sys
 values = json.loads(sys.argv[1])
-# Keep HCCL WORLD alive: recreating it breaks custom SMLA metadata on CANN 9.2/A3.
-# Model offload and subgroup reload remain enabled; allow an explicit train-env override.
-values.setdefault("SLIME_DESTROY_WORLD_PROCESS_GROUP", "0")
 for key, raw in zip(("GLM53_MOE_DISPATCH_CHUNK_SIZE", "GLM53_EXPERT_TOKEN_CHUNK_SIZE"), sys.argv[2:]):
     size = int(raw)
     assert size >= 0, key
@@ -108,48 +92,46 @@ PY_CHUNKS
 
 # Rollout, optimizer, parallelism and SGLang settings.
 ARGS=(
-    --actor-num-nodes 1 --actor-num-gpus-per-node 16 --num-gpus-per-node 16 --colocate
+    --actor-num-nodes 1 --actor-num-gpus-per-node 2 --colocate
     --train-env-vars "$TRAIN_ENV_JSON"
     "${MODEL_ARGS[@]}"
     --hf-checkpoint "$HF_CHECKPOINT" --load "$HF_CHECKPOINT" --megatron-to-hf-mode raw
-    --save "$SAVE_DIR" --save-interval "$SAVE_INTERVAL"
-    --no-save-optim --no-save-rng
     --prompt-data "$PROMPT_DATA" --input-key prompt --label-key label --apply-chat-template
-    --multimodal-keys '{"image":"images"}'
-    --apply-chat-template-kwargs "$(cat /mnt/share/l00937981/glm_53_flash_slime/geometry3k/chat_template_kwargs.json)"
-    --rm-type "${RM_TYPE:-deepscaler}" --seed 522
-    --num-rollout "${NUM_ROLLOUT:-2}" --rollout-batch-size "$ROLLOUT_BATCH_SIZE" --n-samples-per-prompt "$N_SAMPLES_PER_PROMPT"
-    --global-batch-size "$GLOBAL_BATCH_SIZE" --micro-batch-size 1
+    --custom-rm-path parity_reward.score --seed 522
+    --num-rollout "${NUM_ROLLOUT:-2}" --rollout-batch-size 2 --n-samples-per-prompt 2
+    --global-batch-size 4 --micro-batch-size 1
     --rollout-max-response-len "$ROLLOUT_MAX_RESPONSE_LEN" --rollout-temperature 1 --rollout-top-p 1
     --rollout-max-prompt-len "$ROLLOUT_MAX_PROMPT_LEN" --rollout-max-context-len "$MAX_CONTEXT_LEN"
     --advantage-estimator grpo --pg-loss-type reinforce
-    --tensor-model-parallel-size 1 --pipeline-model-parallel-size 4
-    --decoder-first-pipeline-num-layers 12 --decoder-last-pipeline-num-layers 11
-    --context-parallel-size "${CP_SIZE:-1}" --expert-model-parallel-size 4 --expert-tensor-parallel-size 1
+    --tensor-model-parallel-size 1 --pipeline-model-parallel-size 1
+    --context-parallel-size "${CP_SIZE:-1}" --expert-model-parallel-size 2 --expert-tensor-parallel-size 1
     --allgather-cp --moe-token-dispatcher-type alltoall
     --recompute-granularity full --recompute-method uniform --recompute-num-layers 1
     --seq-length "$MAX_CONTEXT_LEN" --max-position-embeddings "$MAX_CONTEXT_LEN"
     # Packing budget only: an oversized individual sample is scheduled alone.
-    --use-dynamic-batch-size --max-tokens-per-gpu 2048 --data-pad-size-multiplier 1024
+    --use-dynamic-batch-size --max-tokens-per-gpu 2048 --data-pad-size-multiplier 64
     --log-probs-chunk-size 1024
     --optimizer adam --lr 1e-6 --lr-decay-style constant --weight-decay 0.1 --adam-beta1 0.9 --adam-beta2 0.98
-    --no-load-optim --no-load-rng --freeze-params-name-list 'model.visual.*'
-    --optimizer-cpu-offload --use-precision-aware-optimizer
-    --overlap-cpu-optimizer-d2h-h2d
-    --rollout-num-gpus-per-engine 16
-    --sglang-device npu --sglang-attention-backend ascend --sglang-tp-size 16
+    --no-load-optim --no-load-rng --no-save-optim --freeze-params-name-list 'model.visual.*'
+    --optimizer-cpu-offload --use-precision-aware-optimizer --no-pin-cpu-grads --no-pin-cpu-params
+    --rollout-num-gpus 1 --rollout-num-gpus-per-engine 1
+    --sglang-device npu --sglang-attention-backend ascend --sglang-tp-size 1
     --sglang-dp-size 1 --sglang-ep-size 1
+    --sglang-enable-deterministic-inference --sglang-disable-radix-cache
+    --sglang-mamba-ssm-dtype float32
     # Keep each image encoder unsharded to match training ViT numerics.
     --sglang-mm-enable-dp-encoder
     --sglang-mem-fraction-static 0.55 --sglang-context-length "$MAX_CONTEXT_LEN"
     --sglang-max-running-requests 32 --sglang-chunked-prefill-size 1024
-    --sglang-disable-overlap-schedule --sglang-cuda-graph-bs 1 2 4 8 16 24 32
+    --sglang-disable-overlap-schedule --sglang-disable-cuda-graph
     --sglang-page-size 64 --sglang-kv-cache-dtype bfloat16 --sglang-watchdog-timeout 1200
     --attention-dropout 0 --hidden-dropout 0 --bf16
     --accumulate-allreduce-grads-in-fp32 --attention-softmax-in-fp32
     --distributed-timeout-minutes 20 --update-weight-buffer-size 268435456
     --rollout-data-transport object-store
     --check-weight-update-equal
+    --rollout-data-postprocess-path parity_measure.compare_old
+    --get-mismatch-metrics --custom-tis-function-path parity_measure.measure_only
     --use-rollout-routing-replay
 )
 
@@ -165,4 +147,8 @@ if [[ -n ${SAVE_DEBUG_ROLLOUT_DATA:-} ]]; then
 fi
 [[ -z ${SAVE_DEBUG_TRAIN_DATA:-} ]] || ARGS+=(--save-debug-train-data "$SAVE_DEBUG_TRAIN_DATA")
 
+if [[ ${GLM53_LAYER_TRACE:-0} == 1 ]]; then
+    ARGS+=(--rollout-function-path parity_trace_rollout.capture
+        --custom-megatron-before-log-prob-hook-path parity_layer_trace.install_training)
+fi
 glm53_submit "$@"
