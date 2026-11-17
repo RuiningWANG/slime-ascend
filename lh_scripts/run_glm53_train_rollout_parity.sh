@@ -29,10 +29,11 @@ fi
 : "${GLM53_BI_DEPS:?set the directory containing python/ and vendor-env.path}"
 : "${SGLANG_PYTHONPATH:?set the matching SGLang branch python directory}"
 export GLM53_LOGP_PARITY_ONLY=1
-export GLM53_BI_KDA_MODE=per-sequence
+export GLM53_TRAIN_ROLLOUT_PARITY=1
+export GLM53_BI_KDA_MODE=per-sequence GLM53_BI_KDA_DECODE_PER_SEQUENCE=1
 export GLM53_NUM_NPUS=8
 export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
-export NUM_ROLLOUT=${NUM_ROLLOUT:-1}
+export NUM_ROLLOUT=${NUM_ROLLOUT:-2}
 export ASCEND_USE_FIA=1
 export HCCL_OP_EXPANSION_MODE=AICPU_TS
 export HCCL_BUFFSIZE=256 DEEPEP_HCCL_BUFFSIZE=256
@@ -44,13 +45,13 @@ source "${SCRIPT_DIR}/../runtime/lh-ascend-runtime.sh"
 export HCCL_EXEC_TIMEOUT=3600 HCCL_CONNECT_TIMEOUT=3600 ACL_DEVICE_SYNC_TIMEOUT=3600
 
 EXPERIMENT_NAME=glm53_geo3k
-RM_TYPE=math
+RM_TYPE=${RM_TYPE:-math}
 CP_SIZE=1
 
 # Prompt limit includes the chat template. Total context capacity includes prompt and response.
-ROLLOUT_MAX_RESPONSE_LEN=128
-ROLLOUT_MAX_PROMPT_LEN=1024
-MAX_CONTEXT_LEN=4096
+ROLLOUT_MAX_RESPONSE_LEN=${ROLLOUT_MAX_RESPONSE_LEN:-64}
+ROLLOUT_MAX_PROMPT_LEN=${ROLLOUT_MAX_PROMPT_LEN:-1024}
+MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN:-2048}
 
 # Model architecture (top16 checkpoint).
 MODEL_ARGS=(
@@ -116,8 +117,8 @@ ARGS=(
     --prompt-data "$PROMPT_DATA" --input-key prompt --label-key label --apply-chat-template
     --multimodal-keys '{"image":"images"}'
     --rm-type "${RM_TYPE:-deepscaler}" --seed 522
-    --num-rollout "${NUM_ROLLOUT:-2}" --rollout-batch-size 4 --n-samples-per-prompt 4
-    --global-batch-size 16 --micro-batch-size 1
+    --num-rollout "${NUM_ROLLOUT:-2}" --rollout-batch-size 2 --n-samples-per-prompt 2
+    --global-batch-size 4 --micro-batch-size 1
     --rollout-max-response-len "$ROLLOUT_MAX_RESPONSE_LEN" --rollout-temperature 1 --rollout-top-p 1
     --rollout-max-prompt-len "$ROLLOUT_MAX_PROMPT_LEN" --rollout-max-context-len "$MAX_CONTEXT_LEN"
     --advantage-estimator grpo --pg-loss-type reinforce
@@ -128,21 +129,21 @@ ARGS=(
     --recompute-granularity full --recompute-method uniform --recompute-num-layers 1
     --seq-length "$MAX_CONTEXT_LEN" --max-position-embeddings "$MAX_CONTEXT_LEN"
     # Packing budget only: an oversized individual sample is scheduled alone.
-    --use-dynamic-batch-size --max-tokens-per-gpu 2048 --data-pad-size-multiplier 1024
+    --use-dynamic-batch-size --max-tokens-per-gpu 2048 --data-pad-size-multiplier 64
     --log-probs-chunk-size 1024
     --optimizer adam --lr 1e-6 --lr-decay-style constant --weight-decay 0.1 --adam-beta1 0.9 --adam-beta2 0.98
     --no-load-optim --no-load-rng --no-save-optim --freeze-params-name-list 'model.visual.*'
     --optimizer-cpu-offload --use-precision-aware-optimizer
-    --overlap-cpu-optimizer-d2h-h2d
-    --rollout-num-gpus-per-engine 8
-    --sglang-device npu --sglang-attention-backend ascend --sglang-tp-size 8
+    --no-pin-cpu-grads --no-pin-cpu-params
+    --rollout-num-gpus 1 --rollout-num-gpus-per-engine 1
+    --sglang-device npu --sglang-attention-backend ascend --sglang-tp-size 1
     --sglang-dp-size 1 --sglang-ep-size 1
     --sglang-enable-deterministic-inference --sglang-disable-radix-cache
     --sglang-mamba-ssm-dtype float32
     # Keep each image encoder unsharded to match training ViT numerics.
     --sglang-mm-enable-dp-encoder
-    --sglang-mem-fraction-static 0.55 --sglang-context-length "$MAX_CONTEXT_LEN"
-    --sglang-max-running-requests 32 --sglang-chunked-prefill-size 1024
+    --sglang-mem-fraction-static 0.82 --sglang-context-length "$MAX_CONTEXT_LEN"
+    --sglang-max-running-requests 8 --sglang-chunked-prefill-size 1024
     --sglang-disable-overlap-schedule --sglang-disable-cuda-graph
     --sglang-page-size 64 --sglang-kv-cache-dtype bfloat16 --sglang-watchdog-timeout 1200
     --attention-dropout 0 --hidden-dropout 0 --bf16
@@ -150,12 +151,13 @@ ARGS=(
     --distributed-timeout-minutes 20 --update-weight-buffer-size 268435456
     --rollout-data-transport object-store
     --check-weight-update-equal
-    --rollout-function-path slime.rollout.glm53_rollout_replay.generate
-    --rollout-data-postprocess-path slime.rollout.glm53_measure_parity.compare
-    --use-rollout-routing-replay
+    --use-rollout-routing-replay --use-rollout-logprobs
 )
 
 # Optional fixed-input numerical diagnostics.
+if [[ ${GLM53_GEO3K_REPLAY:-0} == 1 ]]; then
+    ARGS+=(--rollout-function-path slime.rollout.glm53_rollout_replay.generate)
+fi
 if [[ -n ${SAVE_DEBUG_ROLLOUT_DATA:-} ]]; then
     # Durable rollout capture enables recovery; keep optimizer/RNG checkpoint state.
     diagnostic_args=()

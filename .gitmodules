@@ -1,4 +1,4 @@
 [submodule "slime"]
 	path = slime
 	url = https://github.com/RuiningWANG/slime.git
-	branch = train_rollout_20261116
+	branch = 20261117_full_layer_16_experts
