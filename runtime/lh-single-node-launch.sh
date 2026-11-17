@@ -36,7 +36,7 @@ export LD_LIBRARY_PATH="$CONDA_ENV/lib:${LD_LIBRARY_PATH:-}"
 export PYTHONPATH="$DEPS_ROOT/slime-ascend/scripts/lib/glm53/runtime:$SLIME_ROOT:$DEPS_ROOT/Megatron-LM:$DEPS_ROOT/MegatronAdaptor:$DEPS_ROOT/TransformerEngineNPU:${GLM53_MEGATRON_BRIDGE_ROOT:-$DEPS_ROOT/Megatron-Bridge/src}:${SGLANG_PYTHONPATH:-$DEPS_ROOT/sglang/python}:${PYTHONPATH:-}"
 export GLM53_NATIVE_ROOT="$DEPS_ROOT"
 if [[ ${GLM53_LOGP_PARITY_ONLY:-0} == 1 ]]; then
-    export PYTHONPATH="$GLM53_RUNTIME_DIR/../scripts/lib/glm53/parity:$GLM53_BI_DEPS/python:$GLM53_RUNTIME_DIR/../scripts/lib/glm53/runtime:$PYTHONPATH"
+    export PYTHONPATH="$GLM53_BI_DEPS/python:$GLM53_RUNTIME_DIR/../scripts/lib/glm53/runtime:$PYTHONPATH"
     export GLM53_NATIVE_HC_SHIM=1 SGLANG_NPU_HC_PRE_TAIL_GUARD=1
 fi
 # New native training workers use the validated CANN mHC path; torch remains an A/B override.
@@ -92,7 +92,9 @@ PY_CHECK
         fi
         export GLM53_PARITY_REPORT_DIR="$RUN_DIR"
         export GLM53_BATCH_REPORT="$RUN_DIR/batch-invariance.json"
-        export GLM53_TRACE_DIR="$RUN_DIR"
+        if [[ -z ${SAVE_DEBUG_TRAIN_DATA:-} ]]; then
+            ARGS+=(--save-debug-train-data "$RUN_DIR/train-{rollout_id}-{rank}.pt")
+        fi
     fi
     export TMPDIR=$(mktemp -d /tmp/g53lh.XXXXXX)
     export RAY_TMPDIR="$TMPDIR/ray" TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$RUN_DIR/triton}" TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$RUN_DIR/torch-extensions}"
