@@ -29,8 +29,20 @@ fi
 : "${GLM53_BI_DEPS:?set the directory containing python/ and vendor-env.path}"
 : "${SGLANG_PYTHONPATH:?set the matching SGLang branch python directory}"
 export GLM53_LOGP_PARITY_ONLY=1
-export GLM53_TRAIN_ROLLOUT_PARITY=1
-export GLM53_BI_KDA_MODE=per-sequence GLM53_BI_KDA_DECODE_PER_SEQUENCE=1
+GLM53_ZERO_MISMATCH_PROFILE=${GLM53_ZERO_MISMATCH_PROFILE:-tp8}
+GLM53_ZERO_MISMATCH_ARM=${GLM53_ZERO_MISMATCH_ARM:-aligned}
+case "$GLM53_ZERO_MISMATCH_ARM" in
+    aligned|native) ;;
+    *) echo "Expected GLM53_ZERO_MISMATCH_ARM=aligned or native" >&2; exit 2 ;;
+esac
+if [[ $GLM53_ZERO_MISMATCH_ARM == aligned ]]; then
+    export GLM53_TRAIN_ROLLOUT_PARITY=1
+    export GLM53_BI_KDA_MODE=per-sequence GLM53_BI_KDA_DECODE_PER_SEQUENCE=1
+else
+    export GLM53_TRAIN_ROLLOUT_PARITY=0
+    export GLM53_BI_KDA_MODE=native GLM53_BI_KDA_DECODE_PER_SEQUENCE=0
+fi
+export GLM53_NPU_DETERMINISTIC_LEVEL_3=1
 export GLM53_NUM_NPUS=8
 export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 export NUM_ROLLOUT=${NUM_ROLLOUT:-2}
@@ -49,9 +61,42 @@ RM_TYPE=${RM_TYPE:-math}
 CP_SIZE=1
 
 # Prompt limit includes the chat template. Total context capacity includes prompt and response.
-ROLLOUT_MAX_RESPONSE_LEN=${ROLLOUT_MAX_RESPONSE_LEN:-64}
 ROLLOUT_MAX_PROMPT_LEN=${ROLLOUT_MAX_PROMPT_LEN:-1024}
-MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN:-2048}
+case "$GLM53_ZERO_MISMATCH_PROFILE" in
+    tp8)
+        ROLLOUT_MAX_RESPONSE_LEN=${ROLLOUT_MAX_RESPONSE_LEN:-2048}
+        MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN:-4096}
+        BATCH_ARGS=(--rollout-batch-size 8 --n-samples-per-prompt 8 --global-batch-size 64
+                    --data-pad-size-multiplier 1024 --overlap-cpu-optimizer-d2h-h2d)
+        SERVING_ARGS=(--rollout-num-gpus-per-engine 8 --sglang-tp-size 8
+                      --sglang-mem-fraction-static 0.55 --sglang-max-running-requests 32
+                      --sglang-cuda-graph-bs 1 2 4 8 16 24 32)
+        for key in SGLANG_BI KDA_RADIX INDEXER SPARSE_ATTENTION KDA_PROJECT MLA_PROJECT \
+                   DENSE_PROJECT MOE_PROJECT FINAL_MEAN KPOOL_CACHE KPOOL_DECODE DECODE_INDEXER_WEIGHTS; do
+            if [[ $GLM53_ZERO_MISMATCH_ARM == aligned ]]; then
+                export "GLM53_STRICT_${key}=1"
+            else
+                export "GLM53_STRICT_${key}=0"
+            fi
+        done
+        if [[ $GLM53_ZERO_MISMATCH_ARM == aligned ]]; then
+            export GLM53_KDA_GROUPED_RECURRENCE=${GLM53_KDA_GROUPED_RECURRENCE:-1}
+            export GLM53_KDA_GROUPED_CONV=${GLM53_KDA_GROUPED_CONV:-1}
+        fi
+        ;;
+    tp1)
+        ROLLOUT_MAX_RESPONSE_LEN=${ROLLOUT_MAX_RESPONSE_LEN:-64}
+        MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN:-2048}
+        BATCH_ARGS=(--rollout-batch-size 2 --n-samples-per-prompt 2 --global-batch-size 4
+                    --data-pad-size-multiplier 64 --no-pin-cpu-grads --no-pin-cpu-params
+                    --use-rollout-logprobs)
+        SERVING_ARGS=(--rollout-num-gpus 1 --rollout-num-gpus-per-engine 1 --sglang-tp-size 1
+                      --sglang-mem-fraction-static 0.82 --sglang-max-running-requests 8
+                      --sglang-enable-deterministic-inference --sglang-disable-radix-cache
+                      --sglang-mamba-ssm-dtype float32 --sglang-disable-cuda-graph)
+        ;;
+    *) echo "Expected GLM53_ZERO_MISMATCH_PROFILE=tp8 or tp1" >&2; exit 2 ;;
+esac
 
 # Model architecture (top16 checkpoint).
 MODEL_ARGS=(
@@ -117,8 +162,8 @@ ARGS=(
     --prompt-data "$PROMPT_DATA" --input-key prompt --label-key label --apply-chat-template
     --multimodal-keys '{"image":"images"}'
     --rm-type "${RM_TYPE:-deepscaler}" --seed 522
-    --num-rollout "${NUM_ROLLOUT:-2}" --rollout-batch-size 2 --n-samples-per-prompt 2
-    --global-batch-size 4 --micro-batch-size 1
+    --num-rollout "${NUM_ROLLOUT:-2}" --micro-batch-size 1
+    "${BATCH_ARGS[@]}"
     --rollout-max-response-len "$ROLLOUT_MAX_RESPONSE_LEN" --rollout-temperature 1 --rollout-top-p 1
     --rollout-max-prompt-len "$ROLLOUT_MAX_PROMPT_LEN" --rollout-max-context-len "$MAX_CONTEXT_LEN"
     --advantage-estimator grpo --pg-loss-type reinforce
@@ -129,29 +174,25 @@ ARGS=(
     --recompute-granularity full --recompute-method uniform --recompute-num-layers 1
     --seq-length "$MAX_CONTEXT_LEN" --max-position-embeddings "$MAX_CONTEXT_LEN"
     # Packing budget only: an oversized individual sample is scheduled alone.
-    --use-dynamic-batch-size --max-tokens-per-gpu 2048 --data-pad-size-multiplier 64
+    --use-dynamic-batch-size --max-tokens-per-gpu 2048
     --log-probs-chunk-size 1024
     --optimizer adam --lr 1e-6 --lr-decay-style constant --weight-decay 0.1 --adam-beta1 0.9 --adam-beta2 0.98
     --no-load-optim --no-load-rng --no-save-optim --freeze-params-name-list 'model.visual.*'
     --optimizer-cpu-offload --use-precision-aware-optimizer
-    --no-pin-cpu-grads --no-pin-cpu-params
-    --rollout-num-gpus 1 --rollout-num-gpus-per-engine 1
-    --sglang-device npu --sglang-attention-backend ascend --sglang-tp-size 1
+    "${SERVING_ARGS[@]}"
+    --sglang-device npu --sglang-attention-backend ascend
     --sglang-dp-size 1 --sglang-ep-size 1
-    --sglang-enable-deterministic-inference --sglang-disable-radix-cache
-    --sglang-mamba-ssm-dtype float32
     # Keep each image encoder unsharded to match training ViT numerics.
     --sglang-mm-enable-dp-encoder
-    --sglang-mem-fraction-static 0.82 --sglang-context-length "$MAX_CONTEXT_LEN"
-    --sglang-max-running-requests 8 --sglang-chunked-prefill-size 1024
-    --sglang-disable-overlap-schedule --sglang-disable-cuda-graph
+    --sglang-context-length "$MAX_CONTEXT_LEN"
+    --sglang-chunked-prefill-size 1024 --sglang-disable-overlap-schedule
     --sglang-page-size 64 --sglang-kv-cache-dtype bfloat16 --sglang-watchdog-timeout 1200
     --attention-dropout 0 --hidden-dropout 0 --bf16
     --accumulate-allreduce-grads-in-fp32 --attention-softmax-in-fp32
     --distributed-timeout-minutes 20 --update-weight-buffer-size 268435456
     --rollout-data-transport object-store
     --check-weight-update-equal
-    --use-rollout-routing-replay --use-rollout-logprobs
+    --use-rollout-routing-replay
 )
 
 # Optional fixed-input numerical diagnostics.
