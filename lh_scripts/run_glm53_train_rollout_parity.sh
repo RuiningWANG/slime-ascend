@@ -80,8 +80,12 @@ case "$GLM53_ZERO_MISMATCH_PROFILE" in
             fi
         done
         if [[ $GLM53_ZERO_MISMATCH_ARM == aligned ]]; then
-            export GLM53_KDA_GROUPED_RECURRENCE=${GLM53_KDA_GROUPED_RECURRENCE:-1}
-            export GLM53_KDA_GROUPED_CONV=${GLM53_KDA_GROUPED_CONV:-1}
+            group_kda=1
+            if [[ ${GLM53_GEO3K_EVAL:-0} == 1 ]]; then
+                group_kda=0
+            fi
+            export GLM53_KDA_GROUPED_RECURRENCE=${GLM53_KDA_GROUPED_RECURRENCE:-$group_kda}
+            export GLM53_KDA_GROUPED_CONV=${GLM53_KDA_GROUPED_CONV:-$group_kda}
         fi
         ;;
     tp1)
@@ -194,6 +198,31 @@ ARGS=(
     --check-weight-update-equal
     --use-rollout-routing-replay
 )
+
+# Run a standalone Geo3K scoring pass. Use a distinct LOG_ROOT for each arm.
+if [[ ${GLM53_GEO3K_EVAL:-0} == 1 ]]; then
+    if [[ $NUM_ROLLOUT != 0 || $GLM53_ZERO_MISMATCH_PROFILE != tp8 ]]; then
+        echo "Geo3K scoring requires NUM_ROLLOUT=0 and the tp8 profile" >&2
+        exit 2
+    fi
+    : "${GLM53_PHASE_DIR:?set the directory for the Geo3K evaluation receipts}"
+    : "${GLM53_CHECKPOINT_FINGERPRINT:?set the checkpoint content manifest path}"
+    : "${GLM53_EVAL_CACHE_ENDPOINT:?set the SGLang worker HTTP origin for prefix-cache flushes}"
+    export GLM53_PHASE_DIR GLM53_CHECKPOINT_FINGERPRINT GLM53_EVAL_CACHE_ENDPOINT
+    if [[ $GLM53_ZERO_MISMATCH_ARM == native ]]; then
+        export GLM53_EVAL_ROUNDS=${GLM53_EVAL_ROUNDS:-3}
+    else
+        export GLM53_EVAL_ROUNDS=${GLM53_EVAL_ROUNDS:-1}
+    fi
+    ARGS+=(--eval-interval 1 --eval-prompt-data geo3k "$PROMPT_DATA"
+          --n-samples-per-eval-prompt 8 --eval-input-key prompt --eval-label-key label
+          --eval-temperature 1 --eval-top-p 1
+          --eval-max-prompt-len "$ROLLOUT_MAX_PROMPT_LEN"
+          --eval-max-response-len "$ROLLOUT_MAX_RESPONSE_LEN"
+          --eval-max-context-len "$MAX_CONTEXT_LEN"
+          --eval-function-path slime.rollout.glm53_geo3k_eval.generate_three_rounds
+          --custom-eval-rollout-log-function-path slime.rollout.glm53_geo3k_eval.save)
+fi
 
 # Optional fixed-input numerical diagnostics.
 if [[ ${GLM53_GEO3K_REPLAY:-0} == 1 ]]; then
