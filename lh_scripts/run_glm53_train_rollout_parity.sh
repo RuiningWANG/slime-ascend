@@ -19,6 +19,8 @@ if [[ ${1:-} == --help || ${1:-} == -h ]]; then
     echo "Usage: bash lh_scripts/run_glm53_train_rollout_parity.sh [--check]"
     echo "Set RAY_NODE_IP, DEPS_ROOT, CONDA_ENV, HF_CHECKPOINT, PROMPT_DATA and GLM53_BI_DEPS."
     echo "Set SGLANG_PYTHONPATH to the python directory of the matching SGLang branch."
+    echo "For the aligned TP8 performance configuration, set GLM53_TUNE_ORDERED_SUM=1,"
+    echo "GLM53_TUNE_KDA_ZERO_STATE=1, GLM53_TUNE_KDA_TILE=64 and GLM53_TUNE_MOE_UP=1."
     exit 0
 fi
 : "${RAY_NODE_IP:?set the Ray communication IP}"
