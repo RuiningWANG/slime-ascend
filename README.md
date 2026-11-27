@@ -6,8 +6,7 @@ slime 的昇腾适配开发仓（patch 管理版）
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/THUDM/slime)
 
 **slime-ascend** 是为 RL scaling 设计的 LLM post-training 框架 [slime](https://github.com/THUDM/slime) 的华为昇腾 NPU 适配版本。
-上游 slime 以 git submodule 形式引入（`slime/`），所有 NPU 侧改动一律以 **patch 文件**管理，
-由 `build.sh` 一键重置 submodule 并按序应用全部补丁，不直接提交任何上游代码改动。
+上游 slime 以 git submodule 形式引入（`slime/`），Slime 的修改由 `build.sh` 按清单应用到子模块。GLM-5.3 Flash 的算子适配按算子分目录存放，构建时复制到 Slime 的模型包。
 关于 slime 本身的特性与介绍，请参考 [slime 原版文档](https://thudm.github.io/slime/)。
 
 ## 目录
@@ -23,10 +22,10 @@ slime 的昇腾适配开发仓（patch 管理版）
 
 ## 硬件支持
 
-- **Atlas 800T A3**
+- **Atlas 800T A3**（当前维护的镜像目标）
 - **Atlas 800T A2**
-- 推荐配置：CANN 9.0.0 或更高版本；Ascend HDK 25.5.0 或更高版本
-- 推荐环境：Linux arm64，Python 3.11
+- A3 通用镜像和默认安装使用 CANN 9.1.0、Linux arm64、Python 3.12。
+- GLM-5.3 Flash 提供 A3、A5 的 CANN 9.2.0 源码安装配置和八卡 A5 运行示例。见[模型指南](models/glm5.3flash/README.md)。
 
 完整组件版本矩阵见 [快速使用指南 - 组件版本](docs/get_started/quick_start.md#组件版本)。
 
@@ -35,13 +34,14 @@ slime 的昇腾适配开发仓（patch 管理版）
 ```
 slime-ascend/
 ├── build.sh              # 构建脚本：重置 submodule + 按序应用全部补丁 + 验证
-├── docker/               # NPU Dockerfile（A3；A2 换基础镜像与 whl 即可）
+├── docker/               # A3 通用镜像和 GLM-5.3 Flash A5 构建入口
 ├── docs/                 # 项目文档（快速开始、模型支持、开发指南、安全声明）
 ├── slime/                # THUDM/slime submodule，构建产物（补丁直接应用于此工作区）
-├── patches/              # 全部改动，按性质分类（详见 patches/README.md）
+├── models/glm5.3flash/   # 模型指南和按算子分组的适配文件
+├── patches/              # 各仓库补丁，按性质分类（详见 patches/README.md）
 │   ├── npu-compat/         # NPU 硬件差异适配（永久维护）：设备标识、环境变量、资源分配
 │   ├── upstream-fixes/     # 上游 bug 的临时 workaround（上游修复后删除）
-│   ├── features/           # NPU 侧新增能力
+│   ├── features/          # Slime 模型功能补丁
 │   ├── third_party/        # 对依赖组件的补丁（sglang / Megatron-LM / Megatron-Bridge / mbridge / TE-NPU）
 │   └── MANIFEST.toml       # 补丁清单：逐 patch 说明与上游跟踪信息
 └── scripts/              # 安装脚本与运行示例
@@ -79,6 +79,7 @@ cd slime && pip install -e .
 
 - [昇腾（NPU）快速使用](docs/get_started/quick_start.md) — 环境配置、组件版本、训练启动、问题排查
 - [特性与模型支持](docs/supported_models.md) — 训练配置与各模型示例脚本、发布状态
+- [GLM-5.3 Flash](models/glm5.3flash/README.md) — CANN 9.2 依赖、算子与 Geo3K/DAPO 运行示例
 - [开发指南](docs/development.md) — 参数说明、补丁维护、调试
 - [patches/README.md](patches/README.md) — 补丁分类原则与维护流程（补丁维护的权威文档）
 - [patches/MANIFEST.toml](patches/MANIFEST.toml) — 逐 patch 说明与上游跟踪信息

@@ -3,7 +3,7 @@
 #
 # 功能：
 #   1. 重置 slime submodule 到指定 commit
-#   2. 按顺序应用补丁 (npu-compat → upstream-fixes → features)
+#   2. 按 MANIFEST.toml 顺序应用 Slime 补丁
 #   3. 生成可用的 slime-ascend
 
 set -euo pipefail
@@ -11,12 +11,13 @@ set -euo pipefail
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SLIME_DIR="${REPO_ROOT}/slime"
 PATCHES_DIR="${REPO_ROOT}/patches"
+python3 "${REPO_ROOT}/scripts/check_patch_manifest.py"
 UPSTREAM_COMMIT=$(python3 - "${PATCHES_DIR}/MANIFEST.toml" <<'PY'
 import sys
 import tomllib
 from pathlib import Path
 
-print(tomllib.loads(Path(sys.argv[1]).read_text())["upstream_commit"])
+print(tomllib.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))["upstream_commit"], end="")
 PY
 )
 
@@ -108,7 +109,7 @@ echo ""
 # 步骤 1: 清理 slime 目录
 if [ "$CLEAN_BUILD" = true ]; then
     log_info "清理 slime 目录..."
-    rm -rf "${SLIME_DIR}"
+    if [ "$DRY_RUN" = false ]; then rm -rf "${SLIME_DIR}"; fi
     log_success "slime 目录已清理"
     echo ""
 fi
@@ -117,7 +118,7 @@ fi
 if [ "$SKIP_SUBMODULE" = false ]; then
     log_info "初始化/更新 slime submodule..."
 
-    if [ ! -d "${SLIME_DIR}" ]; then
+    if [ ! -e "${SLIME_DIR}/.git" ]; then
         log_info "首次初始化 submodule..."
         if [ "$DRY_RUN" = false ]; then
             git submodule update --init --recursive "${SLIME_DIR}"
@@ -145,89 +146,43 @@ else
     echo ""
 fi
 
-# 按 MANIFEST.toml 的声明顺序应用补丁。Slime 补丁均由 git format-patch
-# 生成，并通过 git am 保留提交边界和作者信息。
-apply_patch_category() {
-    local category=$1
-    local patch_dir="${PATCHES_DIR}/${category}"
-
-    if [ ! -d "${patch_dir}" ] || [ -z "$(ls -A "${patch_dir}" 2>/dev/null)" ]; then
-        log_warn "补丁目录为空: ${category}"
-        return 0
-    fi
-
-    log_info "应用 ${category} 补丁..."
-    local patch_count=0
-    local failed_patches=()
-    local patch_files=()
-
-    mapfile -t patch_files < <(
-        python3 - "${PATCHES_DIR}/MANIFEST.toml" "${category}" <<'PY'
+# The manifest defines the complete order, including patches from different categories.
+patch_list=$(python3 - "${PATCHES_DIR}/MANIFEST.toml" <<'PY'
 import sys
 import tomllib
 from pathlib import Path
 
-manifest_path = Path(sys.argv[1])
-category = sys.argv[2]
-manifest = tomllib.loads(manifest_path.read_text())
-for item in manifest["patches"]:
-    if item["target"] == "slime" and item["category"] == category:
-        print(manifest_path.parent / category / item["file"])
+manifest = Path(sys.argv[1])
+data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+sys.stdout.reconfigure(newline="\n")
+for patch in data["patches"]:
+    if patch["target"] == "slime" and patch["base_commit"] == data["upstream_commit"]:
+        print((manifest.parent / patch["category"] / patch["file"]).as_posix())
 PY
-    )
-
-    for patch in "${patch_files[@]}"; do
-        if [ -f "$patch" ]; then
-            local patch_name=$(basename "$patch")
-
-            if [ "$DRY_RUN" = false ]; then
-                cd "${SLIME_DIR}"
-                if git am "$patch" > /dev/null 2>&1; then
-                    echo "  ✓ ${patch_name}"
-                    ((patch_count++))
-                else
-                    git am --abort > /dev/null 2>&1 || true
-                    log_error "  失败: ${patch_name}"
-                    failed_patches+=("${patch_name}")
-                fi
-                cd "${REPO_ROOT}"
-            else
-                echo "  [DRY-RUN] 应用 ${patch_name}"
-                ((patch_count++))
-            fi
-        fi
-    done
-
-    if [ ${#patch_files[@]} -eq 0 ]; then
-        log_warn "MANIFEST 中没有 ${category} 补丁"
-        return 0
+)
+while IFS= read -r patch; do
+    [[ -n "$patch" ]] || continue
+    if [ "$DRY_RUN" = true ]; then
+        echo "  [DRY-RUN] 应用 $(basename "$patch")"
+    elif git -C "$SLIME_DIR" am "$patch"; then
+        log_success "已应用 $(basename "$patch")"
+    else
+        git -C "$SLIME_DIR" am --abort || true
+        log_error "补丁应用失败: $patch"
+        exit 1
     fi
+done <<< "$patch_list"
 
-    if [ ${#failed_patches[@]} -gt 0 ]; then
-        log_error "以下补丁应用失败:"
-        for p in "${failed_patches[@]}"; do
-            echo "    - $p"
-        done
-        return 1
+# Install the Ascend model guide and operators into the Slime model package.
+model_dir="${REPO_ROOT}/models/glm5.3flash"
+model_dest="${SLIME_DIR}/slime_plugins/models/glm5_next"
+for model_file in "$model_dir/README.md" "$model_dir"/operators/*/*.py; do
+    if [ "$DRY_RUN" = true ]; then
+        echo "  [DRY-RUN] install $(basename "$model_file")"
+    else
+        install -m 0644 "$model_file" "$model_dest/"
     fi
-
-    log_success "应用 ${patch_count} 个 ${category} 补丁"
-    return 0
-}
-
-# 步骤 3: 应用补丁
-echo "=========================================="
-echo "应用补丁"
-echo "=========================================="
-echo ""
-
-# 按顺序应用三类补丁
-apply_patch_category "npu-compat" || exit 1
-echo ""
-apply_patch_category "upstream-fixes" || exit 1
-echo ""
-apply_patch_category "features" || exit 1
-echo ""
+done
 
 # 步骤 4: 验证构建
 log_info "验证构建结果..."

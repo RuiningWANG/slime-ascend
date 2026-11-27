@@ -1,0 +1,165 @@
+From f4576c150b484f5c0c20ad69eeb88e7924a805bf Mon Sep 17 00:00:00 2001
+From: Slime Ascend Integration <integration@localhost>
+Date: Mon, 23 Nov 2026 12:00:00 +0800
+Subject: [PATCH] Support nested memory pools and GLM-5.3 NPU builds
+
+Base-commit: 5e3ae48ff43f247b8a7b569b5dbb947688f2a309
+
+---
+diff --git a/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py b/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py
+index b14c56125bac1300bb1ce52262c48c4fda94c344..a6bf436ae535dbc01785b0500a50b0877db90a0f 100644
+--- a/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py
++++ b/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py
+@@ -1,7 +1,8 @@
+ import ctypes
+ import logging
+ import os
+-from contextlib import contextmanager
++import threading
++from contextlib import ExitStack, contextmanager
+ from typing import Optional
+ 
+ import torch
+@@ -36,6 +37,8 @@
+         capture_error_mode="global",
+         tag: str = _TAG_DEFAULT,
+         enable_cpu_backup: bool = False,
++        *,
++        auto_dispatch_capture=False,
+     ):
+         """Similar to `torch.cuda.graph`, but ensures memory in it to be pauseable."""
+         self._ensure_initialized()
+@@ -43,6 +46,7 @@
+             cuda_graph=cuda_graph,
+             pool=pool,
+             stream=stream,
++            auto_dispatch_capture=auto_dispatch_capture,
+             capture_error_mode=capture_error_mode,
+             tag=tag,
+             enable_cpu_backup=enable_cpu_backup,
+@@ -79,6 +83,14 @@
+         assert (
+             self._impl_ctor_kwargs is not None
+         ), "Cannot configure after initialization"
++        # Keep the caller's explicit graph-compatible allocator policy through
++        # optional imports that set their own default mode. Opt-in only.
++        if (
++            hook_mode == "torch"
++            and os.environ.get("TMS_PRESERVE_PRELOAD_MODE") == "1"
++            and os.environ.get("TMS_HOOK_MODE") == "preload"
++        ):
++            hook_mode = "preload"
+         self._impl_ctor_kwargs["hook_mode"] = hook_mode
+ 
+     def _ensure_initialized(self):
+@@ -98,13 +110,20 @@
+             path_binary=self._hook_util.get_path_binary()
+         )
+         self._mem_pool = torch.npu.MemPool(allocator=self._hook_util.get_allocator())
++        self._region_state = threading.local()
+         _sanity_checks()
+ 
+     @contextmanager
+     def region(self, tag: str, enable_cpu_backup: bool):
+-        with torch.npu.use_mem_pool(self._mem_pool):
+-            with self._with_region_config(tag=tag, enable_cpu_backup=enable_cpu_backup):
+-                yield
++        with ExitStack() as pool_stack:
++            pool_stack.enter_context(torch.npu.use_mem_pool(self._mem_pool))
++            previous_pool_stack = getattr(self._region_state, "pool_stack", None)
++            self._region_state.pool_stack = pool_stack
++            try:
++                with self._with_region_config(tag=tag, enable_cpu_backup=enable_cpu_backup):
++                    yield
++            finally:
++                self._region_state.pool_stack = previous_pool_stack
+ 
+     @contextmanager
+     def cuda_graph(
+@@ -112,6 +131,7 @@
+         cuda_graph,
+         pool,
+         stream,
++        auto_dispatch_capture,
+         capture_error_mode,
+         tag: str,
+         enable_cpu_backup: bool,
+@@ -120,7 +140,11 @@
+             self._hook_mode == "preload"
+         ), "Only hook_mode=preload supports pauseable CUDA Graph currently"
+         with torch.npu.graph(
+-            cuda_graph, pool=pool, stream=stream, capture_error_mode=capture_error_mode
++            cuda_graph,
++            pool=pool,
++            stream=stream,
++            auto_dispatch_capture=auto_dispatch_capture,
++            capture_error_mode=capture_error_mode,
+         ):
+             with self._with_region_config(tag=tag, enable_cpu_backup=enable_cpu_backup):
+                 yield
+@@ -147,19 +171,23 @@
+             raise RuntimeError("disable() should be called only when tms is active")
+ 
+         self._binary_wrapper.cdll.tms_set_interesting_region(False)
++        pool_stack = getattr(self._region_state, "pool_stack", None)
++        if pool_stack is not None:
++            # The allocator routes to the first active scope. End that scope
++            # while allocations belong to the temporary, non-pauseable pool.
++            pool_stack.close()
++        pool = None
+         try:
+-            # Affected by the memory allocation mechanism of torch_npu, a new mempool must be adopted.
+-            # Otherwise, paused virtual addresses may be reused, causing memory conflicts and trigger errors.
+             pool = torch.npu.MemPool()
+             with torch.npu.use_mem_pool(pool):
+                 yield
+-
+             torch.npu.synchronize()
+-            # Note that this operation does not release the device memory immediately. The memory will
+-            # only be released after the memory region is resumed and empty_cache() is invoked.
+-            torch_npu._C._npu_releasePool(torch.npu.current_device(), pool.id)
++        finally:
++            # use_mem_pool releases its scope; destruction owns the final release.
++            # Destroy the temporary pool before restoring the outer scope.
+             del pool
+-        finally:
++            if pool_stack is not None:
++                pool_stack.enter_context(torch.npu.use_mem_pool(self._mem_pool))
+             self._binary_wrapper.cdll.tms_set_interesting_region(True)
+ 
+     def pause(self, tag: Optional[str]):
+diff --git a/contrib/torch_memory_saver/python/torch_memory_saver/hooks/mode_preload.py b/contrib/torch_memory_saver/python/torch_memory_saver/hooks/mode_preload.py
+index e4f31351aba5018e00cb6530da161b3c4f3507ad..8bddc9f50c9c9c4ae8aeac3271e24abc6aecc4cb 100644
+--- a/contrib/torch_memory_saver/python/torch_memory_saver/hooks/mode_preload.py
++++ b/contrib/torch_memory_saver/python/torch_memory_saver/hooks/mode_preload.py
+@@ -24,11 +24,12 @@ class HookUtilModePreload(HookUtilBase):
+ @contextmanager
+ def configure_subprocess():
+     """Configure environment variables for subprocesses. Only needed for hook_mode=preload."""
+-    with _change_env(
+-        "LD_PRELOAD",
+-        str(get_binary_path_from_package("torch_memory_saver_hook_mode_preload")),
+-    ):
+-        yield
++    with _change_env("TMS_HOOK_MODE", "preload"):
++        with _change_env(
++            "LD_PRELOAD",
++            str(get_binary_path_from_package("torch_memory_saver_hook_mode_preload")),
++        ):
++            yield
+ 
+ 
+ @contextmanager
+diff --git a/csrc/deepep/compile_ascend_proj.sh b/csrc/deepep/compile_ascend_proj.sh
+index d0d783fe0a71304ed181de6a96b5bcf1b57a98e2..3693a03eeb4b5775d43fce39acacc4183469b051 100755
+--- a/csrc/deepep/compile_ascend_proj.sh
++++ b/csrc/deepep/compile_ascend_proj.sh
+@@ -55,7 +55,7 @@ BuildOps() {
+   fi
+ 
+   echo "msopgen gen -i ./AddCustom.json -c ai_core-${soc_version} -f pytorch -lan cpp -out ${proj_name}"
+-  msopgen gen -i ./AddCustom.json -c ai_core-${soc_version} -f pytorch -lan cpp -out ${proj_name}
++  python "$(type -P msopgen)" gen -i ./AddCustom.json -c ai_core-${soc_version} -f pytorch -lan cpp -out ${proj_name}
+   rm -rf ./${proj_name}/op_host/add_custom*
+   rm -rf ./${proj_name}/op_kernel/add_custom*
+ }

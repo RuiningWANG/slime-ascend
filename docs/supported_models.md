@@ -12,6 +12,7 @@
 
 | 训练算法 | 支持模型 | 示例脚本 | 发布状态 |
 | -------- | ------- | -------- | -------- |
+| GRPO | GLM-5.3 Flash | [八卡 A5 colocate](../scripts/run-glm5.3-flash-npu.sh) · [CANN 9.2 安装和数据配置](../models/glm5.3flash/README.md) | Preview |
 | GRPO | GLM-4.7-Flash (30B-A3B) | [run-glm4.7-30B-A3B-npu.sh](../scripts/run-glm4.7-30B-A3B-npu.sh) / [128k 长序列](../scripts/run-glm4.7-30b-A3B-npu-128k.sh) | Preview |
 | GRPO | Qwen3-8B | [run-qwen3-8B-npu.sh](../scripts/run-qwen3-8B-npu.sh) / [colocate](../scripts/run-qwen3-8B-npu-colocate.sh) / [全异步](../scripts/run-qwen3-8b-fully_async-npu.sh) | Preview |
 | GRPO | Qwen3-30B-A3B | [run-qwen3-30B-A3B-npu.sh](../scripts/run-qwen3-30B-A3B-npu.sh) | Preview |

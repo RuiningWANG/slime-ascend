@@ -1,4 +1,4 @@
 [submodule "slime"]
 	path = slime
 	url = https://github.com/RuiningWANG/slime.git
-	branch = 4L_train_rollout
+	branch = 20261127_zero_mismatch

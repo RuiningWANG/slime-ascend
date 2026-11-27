@@ -1,0 +1,20 @@
+# Supply an ARM64 development image with CANN 9.2.0, A5 ops, NNAL/ATB,
+# Python 3.12 and the native build toolchain (including Rust).
+ARG CANN_BASE_IMAGE
+FROM ${CANN_BASE_IMAGE}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+WORKDIR /opt/slime-ascend
+ENV SLIME_ASCEND_DEPS_ROOT=/opt/glm53-deps
+ENV MEGATRON_PATH=/opt/glm53-deps/Megatron-LM
+COPY .gitmodules build.sh ./
+COPY scripts/ scripts/
+COPY patches/ patches/
+COPY models/ models/
+COPY docker/Dockerfile.a3.ubuntu22.04.cann910.latest docker/
+
+ARG CANN_ENV=/usr/local/Ascend/ascend-toolkit/set_env.sh
+ARG ATB_ENV=/usr/local/Ascend/nnal/atb/set_env.sh
+RUN source "$CANN_ENV" && source "$ATB_ENV" --cxx_abi=1 && \
+    GIT_COMMITTER_NAME="Slime Ascend Build" GIT_COMMITTER_EMAIL=build@localhost \
+    bash scripts/quick_install.sh --glm5.3-flash a5

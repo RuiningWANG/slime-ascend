@@ -13,17 +13,15 @@ slime 的参数分为三类：
 
 ## 补丁维护
 
-本仓不直接修改提交上游 slime 代码，所有改动以 patch 文件管理。
+Slime 与第三方仓库的改动以补丁维护。GLM-5.3 Flash 的算子适配文件保存在 `models/glm5.3flash/operators/`，由构建脚本安装到子模块。
 补丁分类原则、添加/更新补丁的标准流程、上游同步策略，**以 [patches/README.md](../patches/README.md) 为准**；
 逐 patch 的用途说明与上游跟踪信息见 [patches/MANIFEST.toml](../patches/MANIFEST.toml)。
 
-要点速记：
+新增补丁时，在补丁说明中填写完整的 `Base-commit`，并在 `patches/MANIFEST.toml` 的 `[[patches]]` 条目登记 `target`、`category`、`file`、`base_commit` 和 `sha256`。同一基线的补丁依照清单顺序应用。
 
 ```bash
-bash build.sh                      # 构建出打满补丁的 slime/ 工作区
-cd slime && git diff -- <file> > ../patches/<category>/xxx.patch
-# 在 MANIFEST.toml 登记 [[patches.files]] 条目，并在 patch 头部加一行注释
-bash build.sh                      # 重建验证全部补丁应用成功
+python scripts/check_patch_manifest.py
+bash build.sh --dry-run
 ```
 
 ## 调试

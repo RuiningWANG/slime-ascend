@@ -1,0 +1,2989 @@
+From debbe65c80a3dc28a41f87108ca2c5e7b4cdfec3 Mon Sep 17 00:00:00 2001
+From: Slime Ascend Integration <integration@localhost>
+Date: Mon, 23 Nov 2026 12:00:00 +0800
+Subject: [PATCH] Support GLM-5.3 Flash training and rollout on Ascend
+
+Base-commit: 18868a79b0b083a093798a94ed0f8cb4f71b9c14
+Apply after the existing dev patches for this base in MANIFEST.toml.
+
+---
+diff --git a/requirements.txt b/requirements.txt
+index e3089b0d58d9411e51b1f762f6ef3b69fa54a88b..43dc41ae22cb3286572dbdf15c4f21625062545c 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -19,7 +19,7 @@ ray[default]
+ safetensors
+ sglang-router>=0.3.0
+ straw-queue>=0.1.3
+-sunabako>=0.1.2
++sunabako>=0.1.2; platform_machine == "x86_64"
+ tensorboard
+ transformers
+ wandb
+diff --git a/scripts/models/glm5.3-flash-300B.sh b/scripts/models/glm5.3-flash-300B.sh
+index cf373d67effb7deecd86405f3adeec9ef332b937..2e2f57b4cfc5bde1fec961a5d05945ba3899f63d 100644
+--- a/scripts/models/glm5.3-flash-300B.sh
++++ b/scripts/models/glm5.3-flash-300B.sh
+@@ -22,7 +22,7 @@ MODEL_ARGS=(
+     --normalization RMSNorm
+     --norm-epsilon 1e-5
+     --rotary-base 800000
+-    --num-experts 288
++    --num-experts "${NUM_EXPERTS:-288}"
+     --moe-layer-freq '[0]*3+[1]*42'
+     --moe-ffn-hidden-size 2048
+     --moe-shared-expert-intermediate-size 2048
+diff --git a/setup.py b/setup.py
+index 56fb62d9802bd5330f70a936af86a5cc3527866c..bf8fa219886bbc6e79c718fe6ffbfbf980240f91 100644
+--- a/setup.py
++++ b/setup.py
+@@ -21,7 +21,8 @@ class bdist_wheel(_bdist_wheel):
+         abi_tag = f"{python_version}"
+ 
+         if platform.system() == "Linux":
+-            platform_tag = "manylinux1_x86_64"
++            machine = platform.machine().lower()
++            platform_tag = "manylinux1_x86_64" if machine == "x86_64" else f"linux_{machine}"
+         else:
+             platform_tag = platform.system().lower()
+ 
+diff --git a/slime/backends/megatron_utils/actor.py b/slime/backends/megatron_utils/actor.py
+index 623b3312a1052bc037f14562d1e668ae6c811613..20a5203b5b6031c23e34775a854bab0d049544c1 100644
+--- a/slime/backends/megatron_utils/actor.py
++++ b/slime/backends/megatron_utils/actor.py
+@@ -575,6 +575,9 @@ class MegatronTrainRayActor(TrainRayActor):
+ 
+         train_data_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
+ 
++        if self.args.use_rollout_routing_replay:
++            RoutingReplay.assert_all_consumed()
++
+         if self.args.use_routing_replay:
+             RoutingReplay.clear_all()
+ 
+@@ -673,15 +676,17 @@ class MegatronTrainRayActor(TrainRayActor):
+                 # Clear connection markers only after every rank is connected.
+                 ray.get(self.rollout_manager.clear_updatable_num_new_engines.remote())
+ 
+-        # Ascend's allocator rejects a TMS transition while an asynchronous
+-        # graph capture is still winding down.  Synchronize before disabling
+-        # TMS so weight transfer starts from a quiescent NPU stream.
+-        if self.args.offload_train and hasattr(torch, "npu"):
++        # Finish pending NPU work before disabling the TMS allocation pool.
++        if self.args.offload_train and accelerator.device_type() == "npu":
+             torch.npu.synchronize()
+-        with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
+-            print_memory("before update_weights")
+-            self.weight_updater.update_weights()
+-            print_memory("after update_weights")
++        # NPU empty_cache cannot run inside TMS's private allocation pool.
++        # Exit the pool before flushing deferred cache releases.
++        defer_cache = self.args.offload_train and accelerator.device_type() == "npu"
++        with accelerator.defer_empty_cache() if defer_cache else nullcontext():
++            with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
++                print_memory("before update_weights")
++                self.weight_updater.update_weights()
++                print_memory("after update_weights")
+ 
+         if reconnect_rollout_engines:
+             self.sleep()
+diff --git a/slime/backends/megatron_utils/data.py b/slime/backends/megatron_utils/data.py
+index 6aa025c7a6bab2dadcd73a8128eb9d4e31675f7e..74d0f780d0f683681ad087b2e00a5efd44b42f20 100644
+--- a/slime/backends/megatron_utils/data.py
++++ b/slime/backends/megatron_utils/data.py
+@@ -107,7 +107,8 @@ def get_batch(
+ 
+         padded_lengths = cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
+         max_seqlen = padded_lengths.max().item()
+-        packed_seq_params = PackedSeqParams(
++        packed_seq_params = PackedSeqParamsWithCPUOffsets(
++            cu_seqlens_q_cpu=tuple(cu_seqlens_padded.tolist()),
+             cu_seqlens_q=cu_seqlens_padded,
+             cu_seqlens_kv=cu_seqlens_padded,
+             cu_seqlens_q_padded=cu_seqlens_padded,
+diff --git a/slime/backends/megatron_utils/hf_to_megatron/glm5_next.py b/slime/backends/megatron_utils/hf_to_megatron/glm5_next.py
+index 73ff4f572b8235e12c8e224b65fe5665809865bf..7204a046d56ece67d732af9bb4b09d11c1dcedec 100644
+--- a/slime/backends/megatron_utils/hf_to_megatron/glm5_next.py
++++ b/slime/backends/megatron_utils/hf_to_megatron/glm5_next.py
+@@ -1,5 +1,7 @@
+ import re
+ 
++import torch
++
+ from .common import strip_mcore_wrappers
+ from .deepseek import deepseek_hf_tensor
+ 
+@@ -22,6 +24,11 @@ class _LanguageModelReader:
+ 
+ def glm5_next_hf_tensor(name, reader, config):
+     name = strip_mcore_wrappers(name)
++    if name == "model.visual.merger.gate_up_proj.weight" and name not in reader:
++        return torch.cat(
++            [reader.get_tensor("model.visual.merger.gate_proj.weight"),
++             reader.get_tensor("model.visual.merger.up_proj.weight")], dim=0
++        )
+     if name.startswith("model.visual."):
+         return reader.get_tensor(name)
+     reader = _LanguageModelReader(reader)
+diff --git a/slime/backends/megatron_utils/megatron_to_hf/__init__.py b/slime/backends/megatron_utils/megatron_to_hf/__init__.py
+index 88a94c2372917a8e85c3a042314c5410cb6eaf50..3c28c2097a17e553673b79c566653faee7890faf 100644
+--- a/slime/backends/megatron_utils/megatron_to_hf/__init__.py
++++ b/slime/backends/megatron_utils/megatron_to_hf/__init__.py
+@@ -22,6 +22,9 @@ def convert_to_hf(args, model_name, name, param, quantization_config=None, trans
+     while hf_name.startswith("module."):
+         hf_name = hf_name.removeprefix("module.")
+     if hf_name.startswith("model.visual."):
++        normalized_model = model_name.lower().replace("_", "").replace("-", "")
++        if "glm5next" in normalized_model or "glm53" in normalized_model:
++            return convert_glm5_next_to_hf(args, hf_name, param)
+         return [(hf_name, param)]
+ 
+     param = remove_padding(name, param, args.vocab_size)
+diff --git a/slime/backends/megatron_utils/megatron_to_hf/glm5_next.py b/slime/backends/megatron_utils/megatron_to_hf/glm5_next.py
+index 14aa296a72aeec5b867ab4614b0fad55762e71f8..9bbaa48b9bfeb09a7093c0b14fbeb0143a8b0dcc 100644
+--- a/slime/backends/megatron_utils/megatron_to_hf/glm5_next.py
++++ b/slime/backends/megatron_utils/megatron_to_hf/glm5_next.py
+@@ -6,6 +6,12 @@ from .deepseekv3 import convert_deepseekv3_to_hf
+ 
+ def convert_glm5_next_to_hf(args, name, param):
+     name = strip_mcore_wrappers(name)
++    if name == "model.visual.merger.gate_up_proj.weight":
++        gate, up = param.chunk(2, dim=0)
++        return [("model.visual.merger.gate_proj.weight", gate),
++                ("model.visual.merger.up_proj.weight", up)]
++    if name.startswith("model.visual."):
++        return [(name, param)]
+     match = re.fullmatch(r"decoder\.layers\.(\d+)\.(.+)", name)
+     if match:
+         layer, rest = match.groups()
+diff --git a/slime/backends/megatron_utils/model.py b/slime/backends/megatron_utils/model.py
+index 1d208dc73fe3da2573d34577128171a7760ab7bd..f555d8810ed8d7d10a4740d244ca50c6eb4af173 100644
+--- a/slime/backends/megatron_utils/model.py
++++ b/slime/backends/megatron_utils/model.py
+@@ -29,6 +29,7 @@ try:
+ except ImportError:
+     from megatron.core.utils import unwrap_model
+ from slime.observability import logging_utils, train_metric_utils
++from slime.observability.profile_utils import npu_train_step_profile
+ from slime.utils import accelerator
+ from slime.utils.memory_utils import clear_memory
+ 
+@@ -36,6 +37,7 @@ from .checkpoint import load_checkpoint, save_checkpoint
+ from .data import DataIterator, get_batch
+ from .loss import ROLLOUT_TOP_P_TOKEN_KEYS, get_rollout_top_p_logprob_kwargs, loss_function
+ from .model_provider import get_model_provider_func
++from .pipeline_shapes import prepare_pipeline_shapes
+ from .stateless_adam import StatelessAdam
+ 
+ logger = logging.getLogger(__name__)
+@@ -669,6 +671,7 @@ def train_one_step(
+ 
+     # Forward pass.
+     forward_backward_func = get_forward_backward_func()
++    pipeline_kwargs = prepare_pipeline_shapes(args, model, data_iterator, num_microbatches)
+     losses_reduced = forward_backward_func(
+         forward_step_func=_wrap_forward_step_with_microbatch_pbar(forward_step, microbatch_pbar),
+         data_iterator=data_iterator,
+@@ -678,7 +681,10 @@ def train_one_step(
+         micro_batch_size=args.micro_batch_size,
+         decoder_seq_length=args.decoder_seq_length,
+         forward_only=False,
++        **pipeline_kwargs,
+     )
++    if pipeline_kwargs:
++        pipeline_kwargs["p2p_communicator"].assert_complete()
+ 
+     valid_step = True
+     grad_norm = float("nan")
+@@ -856,18 +862,19 @@ def train(
+     for step_id in range(num_steps_per_rollout):
+ 
+         # Run training step.
+-        loss_dict, grad_norm = train_one_step(
+-            args,
+-            rollout_id,
+-            step_id,
+-            data_iterator,
+-            model,
+-            optimizer,
+-            opt_param_scheduler,
+-            num_microbatches[step_id],
+-            global_batch_sizes[step_id],
+-            microbatch_pbar=microbatch_pbar,
+-        )
++        with npu_train_step_profile(rollout_id * num_steps_per_rollout + step_id + 1):
++            loss_dict, grad_norm = train_one_step(
++                args,
++                rollout_id,
++                step_id,
++                data_iterator,
++                model,
++                optimizer,
++                opt_param_scheduler,
++                num_microbatches[step_id],
++                global_batch_sizes[step_id],
++                microbatch_pbar=microbatch_pbar,
++            )
+ 
+         if step_id == 0:
+             # Enable forward pre-hook after training step has successfully run. All subsequent
+diff --git a/slime/backends/megatron_utils/pipeline_shapes.py b/slime/backends/megatron_utils/pipeline_shapes.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d5104fbc6afc3f1a9b7c578ce09e0f6440220e72
+--- /dev/null
++++ b/slime/backends/megatron_utils/pipeline_shapes.py
+@@ -0,0 +1,138 @@
++"""Pre-plan GLM mHC pipeline shapes without synchronizing each P2P exchange."""
++
++import os
++import weakref
++from collections import deque
++from datetime import timedelta
++
++import torch
++from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
++from megatron.core.pipeline_parallel.schedules import (
++    _build_default_pg_collection,
++    get_schedule_table,
++)
++from megatron.core.utils import get_model_config
++
++from .data import DataIterator
++
++_metadata_groups = weakref.WeakKeyDictionary()
++
++
++def _metadata_group(pp_group):
++    """Keep planning off the accelerator and out of the HCCL P2P sequence."""
++    if pp_group not in _metadata_groups:
++        # All training ranks create groups in the same order. Local group naming
++        # hashes the number of member groups, which can differ at PP endpoints
++        # because only those ranks belong to embedding process groups.
++        dist = torch.distributed
++        bootstrap = dist.new_group(backend="gloo", timeout=timedelta(seconds=120))
++        ranks = dist.get_process_group_ranks(pp_group)
++        memberships = [None] * dist.get_world_size()
++        dist.all_gather_object(memberships, ranks, group=bootstrap)
++        for members in sorted({tuple(group) for group in memberships}):
++            group = dist.new_group(ranks=list(members), backend="gloo", timeout=timedelta(seconds=120))
++            if dist.get_rank() in members:
++                _metadata_groups[pp_group] = group
++        dist.destroy_process_group(bootstrap)
++    return _metadata_groups[pp_group]
++
++
++class PlannedP2PCommunicator(P2PCommunicator):
++    """Use independent FIFO plans for the four interleaved P2P directions."""
++
++    def __init__(self, pp_group, config, lengths, num_chunks):
++        super().__init__(pp_group, config)
++        width = config.glm53_pipeline_hidden_size
++        rank, size = pp_group.rank(), pp_group.size()
++        table = get_schedule_table(len(lengths), num_chunks, config.microbatch_group_size_per_vp_stage)
++        forward = [(micro, chunk) for micro, chunk in table]
++        backward = [(micro, num_chunks - 1 - chunk) for micro, chunk in table]
++
++        def shapes(order, exclude):
++            return deque((lengths[micro], 1, width) for micro, chunk in order if not exclude(chunk))
++
++        first = lambda chunk: rank == 0 and chunk == 0
++        last = lambda chunk: rank == size - 1 and chunk == num_chunks - 1
++        self.plans = {
++            "send_next": shapes(forward, last),
++            "recv_prev": shapes(forward, first),
++            "send_prev": shapes(backward, first),
++            "recv_next": shapes(backward, last),
++        }
++
++    def _communicate_shapes(self, tensor_send_next, tensor_send_prev, recv_prev, recv_next):
++        for direction, tensor in (
++            ("send_next", tensor_send_next),
++            ("send_prev", tensor_send_prev),
++        ):
++            if tensor is not None:
++                expected = self.plans[direction].popleft()
++                if tuple(tensor.shape) != expected or tensor.dtype != self.config.pipeline_dtype:
++                    raise RuntimeError(
++                        f"PP {direction}: expected {expected}/{self.config.pipeline_dtype}, "
++                        f"got {tuple(tensor.shape)}/{tensor.dtype}"
++                    )
++        prev = self.plans["recv_prev"].popleft() if recv_prev else (0, 0, 0)
++        nxt = self.plans["recv_next"].popleft() if recv_next else (0, 0, 0)
++        return prev, nxt
++
++    def assert_complete(self):
++        remaining = {name: len(queue) for name, queue in self.plans.items() if queue}
++        if remaining:
++            raise RuntimeError(f"Unconsumed PP shape plan: {remaining}")
++
++
++def _planned_lengths(data_iterator, num_microbatches, pad_multiplier):
++    """Mirror CP=TP=1 get_batch padding, reading only CPU tensor metadata."""
++    if not data_iterator or not all(isinstance(it, DataIterator) for it in data_iterator):
++        return None
++    plans = []
++    for it in data_iterator:
++        indices = it.micro_batch_indices[it.offset : it.offset + num_microbatches]
++        tokens = it.rollout_data.get("tokens")
++        if len(indices) != num_microbatches or tokens is None:
++            return None
++        lengths = []
++        for batch in indices:
++            if not batch or any(tokens[i].ndim != 1 for i in batch):
++                return None
++            length = sum(tokens[i].numel() for i in batch)
++            if length <= 0:
++                return None
++            lengths.append((length + pad_multiplier - 1) // pad_multiplier * pad_multiplier)
++        plans.append(lengths)
++    return plans[0] if all(plan == plans[0] for plan in plans) else None
++
++
++def prepare_pipeline_shapes(args, model, data_iterator, num_microbatches):
++    """Return schedule kwargs, or collectively fall back to dynamic exchange.
++
++    Restricted to GLM mHC interleaved training with TP=CP=1. Other models,
++    schedules and partitioning schemes retain the existing communicator.
++    """
++    config = get_model_config(model[0])
++    if (
++        not getattr(config, "glm53_pipeline_hidden_size", None)
++        or (config.virtual_pipeline_model_parallel_size or 1) < 2
++        or config.pipeline_model_parallel_size < 2
++        or config.tensor_model_parallel_size != 1
++        or config.context_parallel_size != 1
++    ):
++        return {}
++    pg = _build_default_pg_collection()
++    lengths = None
++    if os.environ.get("GLM53_PP_PRECOMPUTE_SHAPES", "1") == "1":
++        lengths = _planned_lengths(data_iterator, num_microbatches, args.data_pad_size_multiplier)
++    # One small collective per step: every PP rank must choose the same path.
++    local = torch.tensor(
++        lengths or [-1] * num_microbatches,
++        dtype=torch.int64,
++        device="cpu",
++    )
++    gathered = [torch.empty_like(local) for _ in range(pg.pp.size())]
++    torch.distributed.all_gather(gathered, local, group=_metadata_group(pg.pp))
++    plans = [plan.tolist() for plan in gathered]
++    if any(n <= 0 for plan in plans for n in plan) or any(plan != plans[0] for plan in plans):
++        return {}
++    communicator = PlannedP2PCommunicator(pg.pp, config, plans[0], len(model))
++    return {"p2p_communicator": communicator, "pg_collection": pg}
+diff --git a/slime/backends/megatron_utils/update_weight/update_weight_from_tensor.py b/slime/backends/megatron_utils/update_weight/update_weight_from_tensor.py
+index dd06316b37992ee31d78875b04552e35bce2a479..8c8fb5a831c5f2e0c1d2a4b3dea0987b4c9b70a1 100644
+--- a/slime/backends/megatron_utils/update_weight/update_weight_from_tensor.py
++++ b/slime/backends/megatron_utils/update_weight/update_weight_from_tensor.py
+@@ -302,6 +302,8 @@ class UpdateWeightFromTensor:
+             )
+             if flush_cache:
+                 ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
++            # Official SGLang requires one session around the complete bucket stream.
++            ray.get([engine.begin_weight_update.remote() for engine in self.rollout_engines])
+             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+                 post_process_weights(
+                     restore_weights_before_load=True,
+@@ -338,7 +340,7 @@ class UpdateWeightFromTensor:
+         accelerator.ipc_collect()
+         accelerator.empty_cache()
+ 
+-        # int4/fp4 post_process
++        # Finalize all buckets before generation can resume.
+         if self.rank == 0:
+             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+                 post_process_weights(
+@@ -346,6 +348,7 @@ class UpdateWeightFromTensor:
+                     post_process_quantization=True,
+                     rollout_engines=self.rollout_engines,
+                 )
++            ray.get([engine.end_weight_update.remote() for engine in self.rollout_engines])
+             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+         dist.barrier(group=get_gloo_group())
+ 
+diff --git a/slime/backends/sglang_utils/sglang_engine.py b/slime/backends/sglang_utils/sglang_engine.py
+index 32a5ba9561d119cf071960f8a5e708983e195f84..e53c4554b5838cb2e78469298bb97d383150e92b 100644
+--- a/slime/backends/sglang_utils/sglang_engine.py
++++ b/slime/backends/sglang_utils/sglang_engine.py
+@@ -25,6 +25,17 @@ from slime.utils.model_config import sglang_model_config_overrides
+ logger = logging.getLogger(__name__)
+ 
+ 
++def admin_auth_headers():
++    try:
++        import sglang.srt.utils.auth as auth
++    except ModuleNotFoundError as exc:
++        if exc.name != "sglang.srt.utils.auth":
++            raise
++        return {}
++    get_headers = getattr(auth, "admin_auth_headers", None)
++    return get_headers() if get_headers is not None else {}
++
++
+ def get_base_gpu_id(args, rank):
+     num_gpus = min(args.num_gpus_per_node, args.rollout_num_gpus_per_engine)
+     if args.colocate:
+@@ -68,6 +79,7 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
+         base_url=server_args.url(),
+         api_key=server_args.api_key,
+         is_process_alive=lambda: p.is_alive(),
++        wait_for_metadata=(server_args.device == "npu" and server_args.dp_size > 1),
+     )
+ 
+     return p
+@@ -108,10 +120,11 @@ def _prepare_server_stdin():
+     sys.stdin = os.fdopen(0, "r", closefd=False)
+ 
+ 
+-def _wait_server_healthy(base_url, api_key, is_process_alive):
++def _wait_server_healthy(base_url, api_key, is_process_alive, wait_for_metadata=False):
+     headers = {
+         "Content-Type": "application/json; charset=utf-8",
+         "Authorization": f"Bearer {api_key}",
++        **admin_auth_headers(),
+     }
+ 
+     with requests.Session() as session:
+@@ -128,6 +141,20 @@ def _wait_server_healthy(base_url, api_key, is_process_alive):
+ 
+             time.sleep(2)
+ 
++        if wait_for_metadata:
++            # A health generation can finish on one DP rank while peers are
++            # still compiling. The router needs metadata from every rank.
++            while True:
++                try:
++                    response = session.get(f"{base_url}/server_info", headers=headers, timeout=5)
++                    if response.status_code == 200:
++                        break
++                except requests.RequestException:
++                    pass
++                if not is_process_alive():
++                    raise Exception("Server process terminated before metadata became ready.")
++                time.sleep(2)
++
+ 
+ class SGLangEngine(RayActor):
+     def __init__(
+@@ -255,6 +282,21 @@ class SGLangEngine(RayActor):
+                 json=payload,
+             )
+             response.raise_for_status()
++            if server_args_dict.get("device") == "npu" and server_args_dict.get("dp_size", 1) > 1:
++                # POST may only enqueue registration. Finish before later model
++                # operations can block the router's metadata request again.
++                deadline = time.monotonic() + 60
++                while time.monotonic() < deadline:
++                    registered = requests.get(
++                        f"http://{self.router_ip}:{self.router_port}/workers", timeout=5
++                    )
++                    registered.raise_for_status()
++                    workers = registered.json().get("workers", [])
++                    if any(w.get("url") == worker_url and w.get("is_healthy") for w in workers):
++                        break
++                    time.sleep(1)
++                else:
++                    raise RuntimeError(f"Router did not finish registering {worker_url} within 60 seconds.")
+ 
+     def _make_request(self, endpoint: str, payload: dict | None = None, *, timeout=None):
+         """Make a POST request to the specified endpoint with the given payload.
+@@ -270,7 +312,9 @@ class SGLangEngine(RayActor):
+             return
+ 
+         url = f"http://{self.server_host}:{self.server_port}/{endpoint}"
+-        response = requests.post(url, json=payload or {}, timeout=timeout)
++        response = requests.post(
++            url, json=payload or {}, headers=admin_auth_headers(), timeout=timeout
++        )
+         try:
+             response.raise_for_status()
+         except requests.exceptions.HTTPError as e:
+@@ -295,11 +339,18 @@ class SGLangEngine(RayActor):
+ 
+         response = requests.get(
+             f"http://{self.server_host}:{self.server_port}/health_generate",
++            headers=admin_auth_headers(),
+             timeout=timeout,
+         )
+         response.raise_for_status()
+         return True
+ 
++    def begin_weight_update(self):
++        return self._make_request("begin_weight_update", {})
++
++    def end_weight_update(self):
++        return self._make_request("end_weight_update", {})
++
+     def update_weights_from_tensor(
+         self,
+         serialized_named_tensors: list[str],
+@@ -332,7 +383,10 @@ class SGLangEngine(RayActor):
+         # flush cache will not return status_code 200 when there are pending requests
+         for _ in range(60):
+             try:
+-                response = requests.get(f"http://{self.server_host}:{self.server_port}/flush_cache")
++                response = requests.get(
++                    f"http://{self.server_host}:{self.server_port}/flush_cache",
++                    headers=admin_auth_headers(),
++                )
+                 if response.status_code == 200:
+                     break
+                 logger.info(f"Error flushing cache: HTTP {response.status_code} {response.text!r}")
+@@ -375,7 +429,15 @@ class SGLangEngine(RayActor):
+         if self.node_rank != 0:
+             return
+         url = f"http://{self.server_host}:{self.server_port}/get_weight_version"
+-        response = requests.get(url, timeout=self.args.rollout_health_check_timeout)
++        response = requests.get(
++            url, headers=admin_auth_headers(), timeout=self.args.rollout_health_check_timeout
++        )
++        if response.status_code in (404, 405):
++            # Use model_info when the weight-version endpoint is unavailable.
++            url = f"http://{self.server_host}:{self.server_port}/model_info"
++            response = requests.get(
++                url, headers=admin_auth_headers(), timeout=self.args.rollout_health_check_timeout
++            )
+         response.raise_for_status()
+         return response.json()["weight_version"]
+ 
+@@ -499,14 +561,20 @@ class SGLangEngine(RayActor):
+     def pause_generation(self, mode: str = "abort"):
+         if self.node_rank != 0:
+             return
+-        response = requests.post(f"http://{self.server_host}:{self.server_port}/pause_generation", json={"mode": mode})
++        response = requests.post(
++            f"http://{self.server_host}:{self.server_port}/pause_generation",
++            json={"mode": mode}, headers=admin_auth_headers(),
++        )
+         response.raise_for_status()
+         return response
+ 
+     def continue_generation(self):
+         if self.node_rank != 0:
+             return
+-        response = requests.post(f"http://{self.server_host}:{self.server_port}/continue_generation", json={})
++        response = requests.post(
++            f"http://{self.server_host}:{self.server_port}/continue_generation",
++            json={}, headers=admin_auth_headers(),
++        )
+         response.raise_for_status()
+         return response
+ 
+@@ -542,11 +610,13 @@ class SGLangEngine(RayActor):
+         profile_by_stage: bool = False,
+         with_stack: bool | None = None,
+         record_shapes: bool | None = None,
++        npu_profile_tp_rank: int | None = None,
+     ):
+         if self.node_rank != 0:
+             return
+         response = requests.post(
+             f"http://{self.server_host}:{self.server_port}/start_profile",
++            headers=admin_auth_headers(),
+             json={
+                 "output_dir": output_dir,
+                 "start_step": start_step,
+@@ -555,6 +625,7 @@ class SGLangEngine(RayActor):
+                 "profile_by_stage": profile_by_stage,
+                 "with_stack": with_stack,
+                 "record_shapes": record_shapes,
++                "npu_profile_tp_rank": npu_profile_tp_rank,
+             },
+         )
+         response.raise_for_status()
+@@ -563,7 +634,10 @@ class SGLangEngine(RayActor):
+     def stop_profile(self):
+         if self.node_rank != 0:
+             return
+-        response = requests.post(f"http://{self.server_host}:{self.server_port}/stop_profile", json={})
++        response = requests.post(
++            f"http://{self.server_host}:{self.server_port}/stop_profile",
++            json={}, headers=admin_auth_headers(),
++        )
+         response.raise_for_status()
+         return response
+ 
+diff --git a/slime/ray/actor_group.py b/slime/ray/actor_group.py
+index 2d1c8777871d96b9b12da20d2047296b74d971d6..c9a98a9ff7a9be3c52a7d197ee1d5b8bb4f37240 100644
+--- a/slime/ray/actor_group.py
++++ b/slime/ray/actor_group.py
+@@ -10,8 +10,8 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+ 
+ from slime.ray.training_recovery import configure_recovery_checkpoint, training_recovery_enabled
+ from slime.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, add_default_ray_env_vars
+-from slime.utils.weight_sync import should_flush_cache
+ from slime.utils import accelerator
++from slime.utils.weight_sync import should_flush_cache
+ 
+ 
+ class RayTrainGroup:
+@@ -98,6 +98,10 @@ class RayTrainGroup:
+             env_vars["LD_PRELOAD"] = dynlib_path
+             env_vars["TMS_INIT_ENABLE"] = "1"
+             env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
++            if accelerator.is_npu_environment():
++                # Ray inherits the prepared CANN environment. Re-sourcing it in
++                # its worker shell also preloads TMS into every shell utility.
++                env_vars["BASH_ENV"] = "/dev/null"
+ 
+         # We cannot do routing replay for critic.
+         if self.args.use_routing_replay and self.role == "actor":
+diff --git a/slime/ray/npu_worker.py b/slime/ray/npu_worker.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a593bbe4c3e4b73ea1ac63351f27551a7e29799
+--- /dev/null
++++ b/slime/ray/npu_worker.py
+@@ -0,0 +1,24 @@
++"""Signal setup for NPU workers started with the memory-saver preload library."""
++
++import signal
++import sys
++from multiprocessing import forkserver
++
++
++def _restore_python_sigint():
++    # A native handler installed before Python starts is reported as None.
++    # Ray and multiprocessing both save and later reinstall the Python value.
++    if signal.getsignal(signal.SIGINT) is None:
++        signal.signal(signal.SIGINT, signal.default_int_handler)
++
++
++def setup():
++    _restore_python_sigint()
++    # Each forkserver starts a fresh interpreter with the same LD_PRELOAD.
++    modules = forkserver._forkserver._preload_modules
++    if __name__ not in modules:
++        forkserver.set_forkserver_preload([*modules, __name__])
++
++
++if any(arg.startswith("from multiprocessing.forkserver import main;") for arg in sys.orig_argv):
++    _restore_python_sigint()
+diff --git a/slime/ray/placement_group.py b/slime/ray/placement_group.py
+index 7f08120193a5c68a5ec96dad1d6be3b5243c7d6b..15599d0410c712049258af33e983a8f9406cfb83 100644
+--- a/slime/ray/placement_group.py
++++ b/slime/ray/placement_group.py
+@@ -77,7 +77,7 @@ def _create_placement_group(num_gpus):
+     for i in range(num_bundles):
+         info_actors.append(
+             InfoActor.options(
+-                resources={device_name: 1},
++                **accelerator.ray_remote_options(1),
+                 scheduling_strategy=PlacementGroupSchedulingStrategy(
+                     placement_group=pg,
+                     placement_group_bundle_index=i,
+diff --git a/slime/ray/rollout.py b/slime/ray/rollout.py
+index 07c83ab439b074ec2359833a172b5bb50f7af365..39f668d3a0323e42c67a20a5c0ae7173b6a3ed51 100644
+--- a/slime/ray/rollout.py
++++ b/slime/ray/rollout.py
+@@ -2,6 +2,7 @@ import itertools
+ import logging
+ import time
+ import uuid
++from contextlib import contextmanager
+ from pathlib import Path
+ from typing import Any
+ 
+@@ -11,6 +12,7 @@ from slime.data.batch_builder import BatchBuilder
+ from slime.data.transport import DiskPayloadRef, accept_raw_rollout, check_rollout_storage, load_rollout_samples
+ from slime.observability import logging_utils
+ from slime.observability.logging_utils import configure_logger, init_tracking
++from slime.observability.profile_utils import npu_update_profile_dir
+ from slime.observability.rollout_data_utils import (
+     load_debug_rollout_data,
+     save_debug_rollout_data,
+@@ -179,7 +181,6 @@ class RolloutManager:
+ 
+     def attach_training(self, args, deployment):
+         """Bind a driver to the same serving owner, including after manager death."""
+-        from slime.data.queue_data_source import QueueDataSource
+         from slime.ray.training_recovery import TrainingResume
+ 
+         was_paused = self.pause_rollout_admission()
+@@ -191,11 +192,14 @@ class RolloutManager:
+         self.servers = deployment.servers
+         if self.recovery is not None:
+             self.recovery.reconcile_checkpoint()
+-            if isinstance(self.data_source, QueueDataSource):
+-                # A queue commit can succeed while its RPC fails. Reconcile on
+-                # live-manager retries too, before training can consume and GC
+-                # a conversion missing from the checkpoint replay window.
+-                self.recovery.reconcile_collection(self.controller, self.data_source.execution_id)
++            if self.args.rollout_data_transport == "straw":
++                from slime.data.queue_data_source import QueueDataSource
++
++                if isinstance(self.data_source, QueueDataSource):
++                    # A queue commit can succeed while its RPC fails. Reconcile on
++                    # live-manager retries too, before training can consume and GC
++                    # a conversion missing from the checkpoint replay window.
++                    self.recovery.reconcile_collection(self.controller, self.data_source.execution_id)
+         # The saved load boundary wins over new CLI settings, while trainer
+         # parallelism and memory limits still come from the new attempt.
+         weight_version = getattr(args, "update_weight_start_version", 0)
+@@ -243,10 +247,11 @@ class RolloutManager:
+ 
+     def _source_state(self):
+         """Snapshot the cursor, leaving live queue tasks with their controller."""
+-        from slime.data.queue_data_source import QueueDataSource
++        if self.args.rollout_data_transport == "straw":
++            from slime.data.queue_data_source import QueueDataSource
+ 
+-        if isinstance(self.data_source, QueueDataSource):
+-            return self.data_source.manager_state()
++            if isinstance(self.data_source, QueueDataSource):
++                return self.data_source.manager_state()
+         if state_dict := getattr(self.data_source, "state_dict", None):
+             return state_dict()
+         return None
+@@ -332,6 +337,34 @@ class RolloutManager:
+             self.servers = ray.get(self.serving.finish_rollout.remote())
+         return result
+ 
++    @contextmanager
++    def _profile_rollout(self, rollout_id):
++        directory = npu_update_profile_dir(rollout_id + 1)
++        if directory is None:
++            yield
++            return
++
++        engine = self._get_updatable_server().engines[0]
++        ray.get(engine.start_profile.remote(
++            output_dir=str(directory / "rollout" / "engine0_tp0"),
++            activities=["CPU", "GPU"],
++            profile_by_stage=True,
++            num_steps=8,
++            npu_profile_tp_rank=0,
++            record_shapes=True,
++            with_stack=False,
++        ))
++        try:
++            yield
++        except BaseException:
++            try:
++                ray.get(engine.stop_profile.remote())
++            except Exception:
++                logger.exception("Failed to stop profiling after rollout %s failed", rollout_id)
++            raise
++        else:
++            ray.get(engine.stop_profile.remote())
++
+     def _generate(self, rollout_id, start_time):
+         if self.recovery is not None and rollout_id in self.recovery.batches:
+             batch = self.recovery.batches[rollout_id]
+@@ -352,7 +385,8 @@ class RolloutManager:
+             if self.args.rollout_data_transport == "straw":
+                 self.batch_builder.raw_ref = batch.raw
+         else:
+-            data, metrics = self._get_rollout_data(rollout_id=rollout_id)
++            with self._profile_rollout(rollout_id):
++                data, metrics = self._get_rollout_data(rollout_id=rollout_id)
+             save_debug_rollout_data(
+                 self.args.save_debug_rollout_data,
+                 data,
+diff --git a/slime/ray/train_actor.py b/slime/ray/train_actor.py
+index e6f1730c621073edb5f775cb26a7e185156e3026..c2b5e733fd1bbd0f28e20d9a82b4157e668039d4 100644
+--- a/slime/ray/train_actor.py
++++ b/slime/ray/train_actor.py
+@@ -28,6 +28,10 @@ def get_local_gpu_id():
+ 
+ class TrainRayActor(RayActor):
+     def __init__(self, world_size, rank, master_addr, master_port):
++        if os.environ.get("TMS_INIT_ENABLE") == "1" and accelerator.is_npu_environment():
++            from slime.ray.npu_worker import setup
++
++            setup()
+         configure_logger()
+ 
+         self._world_size = world_size
+diff --git a/slime/rollout/sglang_rollout.py b/slime/rollout/sglang_rollout.py
+index 9ee9778bfd31c6d9061141f82986089ef931ddd9..97a79133f07dcf6dd41fb7d31c07440d17cc4805 100644
+--- a/slime/rollout/sglang_rollout.py
++++ b/slime/rollout/sglang_rollout.py
+@@ -3,6 +3,8 @@ import copy
+ import inspect
+ import json
+ import logging
++import math
++import os
+ import uuid
+ from argparse import Namespace
+ from collections.abc import Awaitable, Callable
+@@ -18,6 +20,7 @@ from slime.observability.trace_utils import build_sglang_meta_trace_attrs, trace
+ from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput, finalize_rollout_groups
+ from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter, should_drop_dynamic_filter_output
+ from slime.rollout.sample_hooks import apply_rollout_sample_hooks
++from slime.utils import accelerator
+ from slime.utils.async_utils import AsyncPacer, run
+ from slime.utils.data import Dataset
+ from slime.utils.eval_config import EvalDatasetConfig
+@@ -106,7 +109,10 @@ class GenerateState(metaclass=SingletonMeta):
+             skip_special_tokens=args.rollout_skip_special_tokens,
+             no_stop_trim=True,
+             spaces_between_special_tokens=False,
++            ignore_eos=getattr(args, "rollout_ignore_eos", False),
+         )
++        if getattr(args, "rollout_min_new_tokens", None) is not None:
++            self.sampling_params["min_new_tokens"] = args.rollout_min_new_tokens
+         if args.rollout_top_p != 1.0:
+             self.sampling_params["custom_params"] = {"return_top_p_token_ids": True}
+ 
+@@ -161,7 +167,30 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
+         assert isinstance(sample.prompt, str)
+ 
+     state = GenerateState(args)
+-    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
++    router_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
++    url = f"{router_url}/generate"
++    if args.use_rollout_routing_replay and accelerator.device_type() == "npu":
++        # The NPU gateway drops return_routed_experts during request
++        # deserialization. With exactly one regular worker, direct dispatch
++        # preserves the R3 payload without changing worker selection.
++        workers = (await get(f"{router_url}/workers"))["workers"]
++        if len(workers) == 1 and workers[0].get("worker_type", "regular") == "regular":
++            url = f"{workers[0]['url'].rstrip('/')}/generate"
++        elif os.environ.get("GLM53_R3_DIRECT_WORKERS") == "1":
++            # Multi-engine compatibility for gateways that drop the R3 flag.
++            # Stable assignment preserves continuation/session affinity.
++            urls = sorted({
++                worker["url"].rstrip("/")
++                for worker in workers
++                if worker.get("worker_type", "regular") == "regular"
++            })
++            if len(urls) != len(workers) or not urls:
++                raise RuntimeError("R3 direct dispatch requires regular, unique workers")
++            index = (
++                uuid.uuid5(uuid.NAMESPACE_URL, sample.session_id).int
++                if sample.session_id else sample.index
++            )
++            url = f"{urls[index % len(urls)]}/generate"
+ 
+     assert (
+         sample.status == Sample.Status.PENDING or sample.status == Sample.Status.ABORTED
+@@ -170,10 +199,24 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
+     prompt_ids = _prepare_prompt_ids(sample, state.tokenizer, state.processor)
+ 
+     sampling_params["max_new_tokens"] -= sample.response_length
++    if "min_new_tokens" in sampling_params:
++        sampling_params["min_new_tokens"] = max(0, sampling_params["min_new_tokens"] - sample.response_length)
+ 
+     assert (
+         sampling_params["max_new_tokens"] >= 0
+     ), f"max_new_tokens: {sampling_params['max_new_tokens']} should not be less than 0"
++    # Respect the configured total context budget without truncating input tokens.
++    if args.rollout_max_context_len is not None:
++        context_remaining = args.rollout_max_context_len - len(prompt_ids)
++        if context_remaining < 0 or (context_remaining == 0 and sample.response_length == 0):
++            raise ValueError("Prompt leaves no response budget within rollout_max_context_len")
++        sampling_params["max_new_tokens"] = min(sampling_params["max_new_tokens"], context_remaining)
++
++    if "min_new_tokens" in sampling_params:
++        sampling_params["min_new_tokens"] = min(
++            sampling_params["min_new_tokens"], sampling_params["max_new_tokens"]
++        )
++
+     if sampling_params["max_new_tokens"] == 0:
+         sample.status = Sample.Status.TRUNCATED
+         return sample
+@@ -238,11 +281,28 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
+             raise ValueError(f"SGLang routed_experts_start_len differs from request: {returned_start} != {start}")
+ 
+     if "output_token_logprobs" in output["meta_info"]:
+-        new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
+-        new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
++        entries = output["meta_info"]["output_token_logprobs"]
++        invalid = [
++            (index, item[1], item[0])
++            for index, item in enumerate(entries)
++            if item[0] is None or not math.isfinite(float(item[0]))
++        ]
++        if invalid:
++            logger.error(
++                "Invalid generation log-probs: sample=%s endpoint=%s "
++                "finish_reason=%r completion_tokens=%s invalid=%r",
++                sample.index, url, output["meta_info"].get("finish_reason"),
++                output["meta_info"].get("completion_tokens"), invalid[:16],
++            )
++            raise ValueError("SGLang returned missing or non-finite sampled-token log-probs")
++        new_response_tokens = [item[1] for item in entries]
++        new_response_log_probs = [item[0] for item in entries]
+     else:
+         new_response_tokens, new_response_log_probs = [], []
+ 
++    if args.use_rollout_routing_replay and output["meta_info"].get("routed_experts") is None:
++        raise RuntimeError(f"R3 response from {url} is missing routed_experts for sample {sample.index}")
++
+     sample.append_response_tokens(
+         args,
+         tokens=new_response_tokens,
+diff --git a/slime/utils/accelerator/__init__.py b/slime/utils/accelerator/__init__.py
+index 837bc215b656bd757df3b9db744b199cb23aedf7..78846888e150e706eaa009362e0bd42e09a45124 100644
+--- a/slime/utils/accelerator/__init__.py
++++ b/slime/utils/accelerator/__init__.py
+@@ -13,6 +13,8 @@ import os
+ import sys
+ import threading
+ from collections.abc import Callable
++from contextlib import contextmanager
++from contextvars import ContextVar
+ from dataclasses import dataclass
+ from typing import Any
+ 
+@@ -437,7 +439,25 @@ def new_event(*args, **kwargs) -> Any:
+     return event_type(*args, **kwargs)
+ 
+ 
++# Scoped deferral is needed while an NPU private allocation pool is active.
++_cache_deferral_depth = ContextVar("slime_cache_deferral_depth", default=0)
++
++
++@contextmanager
++def defer_empty_cache():
++    depth = _cache_deferral_depth.get()
++    token = _cache_deferral_depth.set(depth + 1)
++    try:
++        yield
++    finally:
++        _cache_deferral_depth.reset(token)
++        if depth == 0:
++            empty_cache()
++
++
+ def empty_cache() -> None:
++    if _cache_deferral_depth.get():
++        return
+     return _backend().empty_cache()
+ 
+ 
+diff --git a/slime/utils/arguments.py b/slime/utils/arguments.py
+index 683f925ab68ae72ceb8757b196e718263270718b..8de64cc41bfdf3b3bf1c3e16da19f269a2b47130 100644
+--- a/slime/utils/arguments.py
++++ b/slime/utils/arguments.py
+@@ -395,6 +395,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
+                 default=1.0,
+                 help="the temperature for the inference engine during rollout. Must be > 0.",
+             )
++            parser.add_argument(
++                "--rollout-ignore-eos",
++                action="store_true",
++                help="SGLang ignore_eos: keep generating until max_new_tokens even after the "
++                "model emits EOS. Pair with --rollout-max-response-len for fixed-length rollouts.",
++            )
+             parser.add_argument(
+                 "--rollout-top-p", type=float, default=1.0, help="the top-p for the inference engine during rollout."
+             )
+@@ -429,6 +435,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
+                     "It is basically `max_tokens` in sglang."
+                 ),
+             )
++            parser.add_argument(
++                "--rollout-min-new-tokens",
++                type=int,
++                default=None,
++                help="Minimum number of new tokens generated during rollout.",
++            )
+             parser.add_argument(
+                 "--rollout-skip-special-tokens",
+                 action="store_true",
+diff --git a/slime/utils/data.py b/slime/utils/data.py
+index bc7c855b3e5129aa0fb42c1a415e5ca86a2016b8..7031b0e943def033b329eff4b9ef255a366baa50 100644
+--- a/slime/utils/data.py
++++ b/slime/utils/data.py
+@@ -111,11 +111,12 @@ def filter_long_prompt(origin_samples: list[Sample], tokenizer, processor, max_l
+                 if len(input_ids) <= max_length:
+                     kept.append((position, sample))
+         if multimodal:
+-            from slime.utils.processing_utils import process_vision_info
++            from slime.utils.processing_utils import build_processor_kwargs
+ 
+             for position, sample in multimodal:
+-                multimodal_inputs = process_vision_info(sample.prompt, processor)
+-                processor_output = processor(text=sample.prompt, **multimodal_inputs)
++                processor_output = processor(
++                    text=sample.prompt, **build_processor_kwargs(sample.multimodal_inputs)
++                )
+                 input_ids = processor_output["input_ids"][0]
+                 if len(input_ids) <= max_length:
+                     kept.append((position, sample))
+@@ -228,6 +229,8 @@ class Dataset:
+         apply_chat_template=False,
+         apply_chat_template_kwargs=None,
+     ):
++        if multimodal_keys and processor is None:
++            raise ValueError("Multimodal dataset requires a valid processor; refusing to drop image inputs.")
+         origin_samples = []
+         for data in read_file(path):
+             # Both chat templates and multimodal inputs require conversation format (list of message dicts)
+diff --git a/slime/utils/processing_utils.py b/slime/utils/processing_utils.py
+index fb652e73d0fbf3d73ce9355e5e960c6f32d5aad2..e1f6ac8d9fe4c94ae4e16d0c9772a9ed429c3dd7 100644
+--- a/slime/utils/processing_utils.py
++++ b/slime/utils/processing_utils.py
+@@ -83,6 +83,13 @@ def _try_load_glm4v_processor(name_or_path: str, **kwargs):
+ 
+ 
+ def load_processor(name_or_path: str, **kwargs):
++    config_path = Path(name_or_path) / "processor_config.json"
++    if config_path.exists():
++        with config_path.open() as f:
++            config = json.load(f)
++        if config.get("processor_class") == "Glm5NextProcessor":
++            from slime_plugins.models.glm5_next.processing import Glm5NextProcessor
++            return Glm5NextProcessor.from_pretrained(name_or_path, **kwargs)
+     try:
+         proc = AutoProcessor.from_pretrained(name_or_path, **kwargs)
+     except (OSError, ValueError) as e:
+diff --git a/slime/utils/tensor_backper.py b/slime/utils/tensor_backper.py
+index 3b0c3a64bf8fd0d125ff20d48fe7711c804c69d4..00768920fc3ec8d93aaf3ffa84bfa75a219240ef 100644
+--- a/slime/utils/tensor_backper.py
++++ b/slime/utils/tensor_backper.py
+@@ -11,6 +11,7 @@ _SourceGetter = Callable[[], Iterable[tuple[str, torch.Tensor]]]
+ class TensorBackuper:
+     def __init__(self, source_getter: _SourceGetter):
+         self._source_getter = source_getter
++        self._pin_cpu_backups = accelerator.device_type() != "npu"
+         self._backups: dict[str, dict[str, torch.Tensor]] = defaultdict(dict)
+ 
+     @property
+@@ -25,8 +26,8 @@ class TensorBackuper:
+         backup_dict = self._backups[tag]
+         for name, param in self._source_getter():
+             if name not in backup_dict:
+-                backup_dict[name] = torch.empty_like(param, device=torch.device("cpu"), pin_memory=True)
+-            backup_dict[name].copy_(param.detach(), non_blocking=True)
++                backup_dict[name] = torch.empty_like(param, device=torch.device("cpu"), pin_memory=self._pin_cpu_backups)
++            backup_dict[name].copy_(param.detach(), non_blocking=self._pin_cpu_backups)
+         accelerator.synchronize()
+ 
+     @torch.no_grad()
+@@ -34,5 +35,5 @@ class TensorBackuper:
+         backup_dict = self._backups[tag]
+         for name, param in self._source_getter():
+             assert name in backup_dict
+-            param.copy_(backup_dict[name], non_blocking=True)
++            param.copy_(backup_dict[name], non_blocking=self._pin_cpu_backups)
+         accelerator.synchronize()
+diff --git a/slime_plugins/models/glm5_next/attention.py b/slime_plugins/models/glm5_next/attention.py
+index d2a3ae071639c8dbb01c67aec0cb67d8e57f8153..efbb2cf32b3aca595c5e5bbc6377b989a7bdba8e 100644
+--- a/slime_plugins/models/glm5_next/attention.py
++++ b/slime_plugins/models/glm5_next/attention.py
+@@ -3,13 +3,25 @@
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+-from fla.modules import FusedRMSNormGated, ShortConvolution
+-from fla.modules.conv import causal_conv1d
+-from fla.ops.cp import build_cp_context
+-from fla.ops.kda import chunk_kda
+-from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+ 
+-from slime_plugins.models.glm5.ops.sparse_mla import SparseMLA
++from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
++from slime.utils import accelerator
++
++if accelerator.device_type() == "npu":
++    from .npu_backend import (
++        FusedRMSNormGated,
++        ShortConvolution,
++        build_cp_context,
++        causal_conv1d,
++        chunk_kda,
++    )
++else:
++    from fla.modules import FusedRMSNormGated, ShortConvolution
++    from fla.modules.conv import causal_conv1d
++    from fla.ops.cp import build_cp_context
++    from fla.ops.kda import chunk_kda
++
++    from slime_plugins.models.glm5.ops.sparse_mla import SparseMLA
+ 
+ from .ops import pooled_indexer_topk
+ 
+@@ -21,6 +33,10 @@ class RMSNorm(nn.Module):
+         self.eps = eps
+ 
+     def forward(self, x):
++        if x.device.type == "npu":
++            import torch_npu
++
++            return torch_npu.npu_rms_norm(x, self.weight, epsilon=self.eps)[0]
+         normalized = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.eps)
+         return (normalized * self.weight.float()).to(x.dtype)
+ 
+@@ -63,9 +79,7 @@ class KimiDeltaAttention(nn.Module):
+         cu = packed_seq_params.cu_seqlens_q
+         cp_context = None
+         if self.cp_group is not None and self.cp_group.size() > 1:
+-            # --allgather-cp partitions the packed stream into contiguous
+-            # intervals. FLA exchanges convolution halos and recurrent states;
+-            # projections and KDA remain local to each interval.
++            # --allgather-cp partitions the packed stream into contiguous intervals.
+             cp_context = build_cp_context(cu, self.cp_group, conv1d_kernel_size=self.q_conv1d.kernel_size[0])
+         qkv = []
+         for name in ("q", "k", "v"):
+@@ -79,10 +93,17 @@ class KimiDeltaAttention(nn.Module):
+                 )
+             qkv.append(convolved.unflatten(-1, (self.heads, self.head_dim)))
+         gate = self.f_b_proj(self.f_a_proj(x)).unflatten(-1, (self.heads, self.head_dim))
++        beta_logits = self.b_proj(x)
++        # Ascend inference computes beta sigmoid in FP32 in prefill and decode.
++        beta = (
++            beta_logits.float().sigmoid()
++            if x.device.type == "npu"
++            else beta_logits.sigmoid()
++        )
+         output, _ = chunk_kda(
+             *qkv,
+             g=gate,
+-            beta=self.b_proj(x).sigmoid(),
++            beta=beta,
+             use_qk_l2norm_in_kernel=True,
+             use_gate_in_kernel=True,
+             safe_gate=self.lower_bound is not None,
+@@ -91,6 +112,8 @@ class KimiDeltaAttention(nn.Module):
+             dt_bias=self.dt_bias,
+             cu_seqlens=cu,
+             cp_context=cp_context,
++            **({"cu_seqlens_cpu": getattr(packed_seq_params, "cu_seqlens_q_cpu", None)}
++               if accelerator.device_type() == "npu" else {}),
+         )
+         output_gate = self.g_b_proj(self.g_a_proj(x)).reshape(-1, self.head_dim)
+         output = self.o_norm(output.reshape(-1, self.head_dim), output_gate).reshape(
+@@ -119,19 +142,32 @@ class PooledIndexer(nn.Module):
+         # MLA-noPE also disables indexer RoPE. The checkpoint already uses
+         # SGLang/HF's channel order, so no half-channel permutation is needed.
+         index_q = self.wq_b(q).view(-1, self.heads, self.dim)
+-        index_k = self.k_norm(self.wk(x))
+-        weights = F.linear(x.float(), self.weights_proj.weight.float()) * (self.heads * self.dim) ** -0.5
++        projected_key = self.wk(x)
++        weights = F.linear(x.float(), self.weights_proj.weight.float())
++        if x.device.type == "npu":
++            from .sglang_kpool import pooled_indexer_topk as select_indices
++
++            index_k = F.layer_norm(
++                projected_key.float(), (self.dim,), self.k_norm.weight.float(),
++                self.k_norm.bias.float(), self.k_norm.eps,
++            ).to(projected_key.dtype)
++            # SGLang rounds head-scaled weights before the kernel applies the dimension scale.
++            weights = (weights * self.heads ** -0.5).to(torch.bfloat16)
++        else:
++            select_indices = pooled_indexer_topk
++            index_k = self.k_norm(projected_key)
++            weights = weights * (self.heads * self.dim) ** -0.5
+         gates = F.linear(x, self.index_kpool_compress_gate)
+         cp_size = cp_group.size() if cp_group is not None else 1
+         cp_rank = cp_group.rank() if cp_group is not None else 0
+         if cp_size > 1:
+             pooled_inputs = gather_from_sequence_parallel_region(torch.cat([index_k, gates], dim=-1), group=cp_group)
+             index_k, gates = pooled_inputs.chunk(2, dim=-1)
+-        return pooled_indexer_topk(
++        return select_indices(
+             index_q,
+-            index_k,
+-            weights,
+-            gates,
++            index_k.reshape(-1, self.dim),
++            weights.reshape(-1, self.heads),
++            gates.reshape(-1, self.dim),
+             self.index_kpool_compress_ape,
+             packed_seq_params.cu_seqlens_q,
+             self.topk,
+@@ -157,11 +193,19 @@ class NopeDSAttention(nn.Module):
+         self.o_proj = nn.Linear(self.heads * self.v_dim, config.hidden_size, bias=False)
+         self.indexer = PooledIndexer(hf_config)
+ 
++    def _project_qkv(self, x):
++        # Keep separate Parameters/checkpoint keys while matching inference's
++        # Q-then-KV row order and single GEMM. Rebuild from current weights so
++        # optimizer updates and autograd remain valid; do not cache a detached copy.
++        weight = torch.cat((self.q_a_proj.weight, self.kv_a_proj_with_mqa.weight), dim=0)
++        return F.linear(x, weight).split((self.q_a_proj.out_features, self.kv_rank), dim=-1)
++
+     def forward(self, hidden_states, packed_seq_params=None, **kwargs):
+         x = hidden_states.squeeze(1)
+-        q_latent = self.q_a_layernorm(self.q_a_proj(x))
++        q_a, kv_a = self._project_qkv(x)
++        q_latent = self.q_a_layernorm(q_a)
+         q = self.q_b_proj(q_latent).view(-1, self.heads, self.qk_dim)
+-        kv = self.kv_a_layernorm(self.kv_a_proj_with_mqa(x))
++        kv = self.kv_a_layernorm(kv_a)
+         wk, wv = self.kv_b_proj.weight.view(self.heads, self.qk_dim + self.v_dim, self.kv_rank).split(
+             (self.qk_dim, self.v_dim), dim=1
+         )
+@@ -172,8 +216,12 @@ class NopeDSAttention(nn.Module):
+             # The gather's backward reduce-scatters contributions to each KV owner.
+             kv = gather_from_sequence_parallel_region(kv, group=self.cp_group)
+         indices = self.indexer(x, q_latent, packed_seq_params, self.cp_group)
+-        # The shared GLM5 sparse kernel uses a 512+64 layout. A zero tail is
+-        # mathematically exact for no-RoPE MLA and keeps its proven backward.
+-        out, _ = SparseMLA.apply(F.pad(q, (0, 64)), F.pad(kv[:, None], (0, 64)), indices, self.qk_dim**-0.5)
++        if q.device.type == "npu":
++            from .ascendc_sparse_attention import sparse_attention
++
++            out = sparse_attention(q, kv[:, None], indices, self.qk_dim**-0.5)
++        else:
++            # Preserve the original GPU SparseMLA 512+64 layout.
++            out, _ = SparseMLA.apply(F.pad(q, (0, 64)), F.pad(kv[:, None], (0, 64)), indices, self.qk_dim**-0.5)
+         out = torch.bmm(out.transpose(0, 1), wv.transpose(1, 2)).transpose(0, 1)
+         return self.o_proj(out.flatten(1)).unsqueeze(1), None
+diff --git a/slime_plugins/models/glm5_next/glm5_next.py b/slime_plugins/models/glm5_next/glm5_next.py
+index b3e59938cf3c8ddff4d6ab2a34991f9896aa21f5..df2f7ed55205debeb7770dd8c4f16fdeb90f91d2 100644
+--- a/slime_plugins/models/glm5_next/glm5_next.py
++++ b/slime_plugins/models/glm5_next/glm5_next.py
+@@ -1,13 +1,16 @@
+ """GLM-5.3 Flash spec for upstream Megatron, following the GLM5 plugin API."""
+ 
+ import copy
++import os
+ 
+ import torch
+ from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec, get_mlp_module_spec_for_backend
++from megatron.core.transformer.enums import LayerType
+ from megatron.core.transformer.spec_utils import ModuleSpec
+ from megatron.core.transformer.transformer_layer import TransformerLayer, get_transformer_layer_offset
+ 
++from slime.utils import accelerator
+ from slime.utils.model_config import load_hf_config
+ 
+ from .attention import KimiDeltaAttention, NopeDSAttention
+@@ -23,6 +26,22 @@ class Glm5NextLayer(TransformerLayer):
+     def __init__(self, *args, hf_config, **kwargs):
+         super().__init__(*args, **kwargs)
+         self.hf_config = hf_config
++        if hasattr(self.mlp, "experts"):
++            if accelerator.device_type() == "npu" and not getattr(hf_config, "router_fp32", False):
++                from .router import install_inference_aligned_router
++
++                install_inference_aligned_router(self.mlp.router)
++            if accelerator.device_type() == "npu":
++                from .moe_weighting import install_inference_aligned_weighting
++
++                install_inference_aligned_weighting(self.mlp, hf_config.routed_scaling_factor)
++            from .moe_chunking import install_moe_chunking
++
++            install_moe_chunking(
++                self.mlp,
++                dispatch_chunk=int(os.environ.get("GLM53_MOE_DISPATCH_CHUNK_SIZE", "0")),
++                expert_chunk=int(os.environ.get("GLM53_EXPERT_TOKEN_CHUNK_SIZE", "0")),
++            )
+         n = hf_config.hc_mult
+         for kind in ("attn", "ffn"):
+             self.register_parameter(
+@@ -83,6 +102,16 @@ class Glm5NextLayer(TransformerLayer):
+ 
+ def get_glm5_next_spec(args, config, vp_stage):
+     hf_config = load_hf_config(args.hf_checkpoint, trust_remote_code=True).text_config
++    if (
++        accelerator.device_type() == "npu"
++        and (config.virtual_pipeline_model_parallel_size or 1) > 1
++        and (not config.overlap_p2p_comm or config.batch_p2p_comm)
++    ):
++        raise ValueError(
++            "GLM5-next VPP on NPU requires overlap_p2p_comm=True and batch_p2p_comm=False: "
++            "blocking bidirectional shape exchange can deadlock with variable-length mHC payloads. "
++            "Keep Megatron's default VPP P2P overlap enabled."
++        )
+     if config.tensor_model_parallel_size != 1:
+         raise ValueError("GLM5-next native attention requires TP=1; use CP, PP and EP to shard the 300B model")
+     if config.context_parallel_size > 1 and not args.allgather_cp:
+@@ -91,22 +120,29 @@ def get_glm5_next_spec(args, config, vp_stage):
+     config.bias_activation_fusion = False
+     config.use_te_activation_func = True
+     config.variable_seq_lengths = True  # Pipeline payloads carry all mHC streams.
++    config.glm53_pipeline_hidden_size = config.hidden_size * hf_config.hc_mult
+     spec = get_gpt_decoder_block_spec(config, use_transformer_engine=True, vp_stage=vp_stage)
+-    offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
++    if config.pipeline_model_parallel_layout is not None:
++        layer_ids = config.pipeline_model_parallel_layout.get_layer_id_list(
++            layer_type=LayerType.decoder, vp_stage=vp_stage
++        )
++    else:
++        offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
++        layer_ids = range(offset, offset + len(spec.layer_specs))
+     kda_layers = set(hf_config.linear_attn_config["kda_layers"])
+     backend = Glm5NextSpecProvider()
+-    for index, layer in enumerate(spec.layer_specs):
++    for index, (layer_id, layer) in enumerate(zip(layer_ids, spec.layer_specs, strict=True)):
+         layer = copy.deepcopy(layer)
+         layer.module = Glm5NextLayer
+         layer.params = {**(layer.params or {}), "hf_config": hf_config}
+         layer.submodules.input_layernorm = backend.layer_norm()
+         layer.submodules.self_attention = ModuleSpec(
+-            module=KimiDeltaAttention if index + offset in kda_layers else NopeDSAttention,
++            module=KimiDeltaAttention if layer_id in kda_layers else NopeDSAttention,
+             params={"hf_config": hf_config},
+         )
+         layer.submodules.mlp = get_mlp_module_spec_for_backend(
+             backend,
+-            num_experts=None if index + offset < hf_config.first_k_dense_replace else config.num_moe_experts,
++            num_experts=None if layer_id < hf_config.first_k_dense_replace else config.num_moe_experts,
+             moe_grouped_gemm=config.moe_grouped_gemm,
+             use_te_activation_func=True,
+         )
+diff --git a/slime_plugins/models/glm5_next/model.py b/slime_plugins/models/glm5_next/model.py
+index f308643c834e09a63c51713d920ad5864940dfa3..030d97a79f0576651278017f95e4a1a76ac2a7e7 100644
+--- a/slime_plugins/models/glm5_next/model.py
++++ b/slime_plugins/models/glm5_next/model.py
+@@ -16,6 +16,8 @@ class Glm5NextModel(MegatronModule):
+         super().__init__(config=config)
+         self.pre_process = pre_process
+         self.post_process = post_process
++        # Schedules and slime's stage-aware helpers inspect the outer VLM.
++        self.vp_stage = vp_stage
+         self.image_token_id = hf_config.image_token_id
+         self.video_token_id = hf_config.video_token_id
+         self.language_model = GPTModel(
+@@ -30,6 +32,7 @@ class Glm5NextModel(MegatronModule):
+             position_embedding_type="none",
+             vp_stage=vp_stage,
+         )
++        self.pg_collection = self.language_model.pg_collection
+         self.model = torch.nn.Module()
+         if pre_process:
+             hf_config.vision_config._attn_implementation = "sdpa"
+@@ -114,8 +117,15 @@ class Glm5NextModel(MegatronModule):
+ def get_glm5_next_model_provider(args, config, vp_stage):
+     hf_config = load_hf_config(args.hf_checkpoint, trust_remote_code=True)
+     spec = get_glm5_next_spec(args, config, vp_stage)
++    spec_vp_stage = vp_stage
+ 
+     def model_provider(pre_process=True, post_process=True, vp_stage=None):
++        if vp_stage is None:
++            vp_stage = spec_vp_stage
++        if vp_stage != spec_vp_stage:
++            raise ValueError(
++                f"GLM5-next spec belongs to virtual stage {spec_vp_stage}, got {vp_stage}"
++            )
+         return Glm5NextModel(
+             config, spec, hf_config, args, pre_process=pre_process, post_process=post_process, vp_stage=vp_stage
+         )
+diff --git a/slime_plugins/models/glm5_next/moe_chunking.py b/slime_plugins/models/glm5_next/moe_chunking.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7ecaf71d6885ddc3e54208fa8f0030be6c41d2f1
+--- /dev/null
++++ b/slime_plugins/models/glm5_next/moe_chunking.py
+@@ -0,0 +1,162 @@
++"""Bound native GLM MoE workspaces without replacing its math kernels.
++
++A chunk size of zero selects the unchunked forward pass.
++Each complete MoE chunk is checkpointed with full replay: the mutable dispatcher is
++reconstructed immediately before its backward, not reused from another chunk.
++"""
++import os
++from contextlib import contextmanager
++from types import MethodType
++
++import torch
++import torch.nn.functional as F
++from torch.utils.checkpoint import checkpoint
++
++
++class _FixedRoutes:
++    def __init__(self, routes):
++        self.routes = routes
++
++    def pop_forward(self):
++        return self.routes
++
++    def pop_backward(self):
++        return self.routes
++
++
++@contextmanager
++def _bind_routes(router, routes):
++    if routes is None:
++        yield
++        return
++    from slime.utils import routing_replay as rr
++
++    original = router.routing_replay
++    previous_global = rr.ROUTING_REPLAY
++    router.routing_replay = _FixedRoutes(routes)
++    try:
++        yield
++    finally:
++        router.routing_replay = original
++        rr.set_routing_replay(previous_global)
++
++
++def _packed_routes(module, length, padded_length):
++    stage = os.environ.get("ROUTING_REPLAY_STAGE", "fallthrough")
++    if os.environ.get("ENABLE_ROUTING_REPLAY", "0") != "1" or stage == "fallthrough":
++        return None
++    if stage not in ("replay_forward", "replay_backward"):
++        raise ValueError("Chunked MoE supports rollout replay or fallthrough, not record mode")
++    replay = module.router.routing_replay
++    routes = replay.pop_forward() if stage == "replay_forward" else replay.pop_backward()
++    if routes.shape != (length, module.config.moe_router_topk):
++        raise ValueError(f"Packed routes {routes.shape} do not match {length} tokens")
++    if padded_length > length:
++        dummy = torch.arange(routes.shape[1], device=routes.device, dtype=routes.dtype)
++        routes = torch.cat((routes, dummy.expand(padded_length - length, -1)))
++    return routes
++
++
++def _checkpoint(fn, *args):
++    # Outer layer recomputation runs the initial forward under no_grad. During
++    # its backward recompute this inner checkpoint bounds expert activations.
++    if torch.is_grad_enabled() and any(x.requires_grad for x in args):
++        return checkpoint(fn, *args, use_reentrant=False, early_stop=False, preserve_rng_state=True)
++    return fn(*args)
++
++
++def _moe_forward(self, hidden_states, intermediate_tensors=None, padding_mask=None):
++    size = self._glm53_dispatch_chunk
++    if not size:
++        return self._glm53_original_forward(hidden_states, intermediate_tensors, padding_mask)
++    if intermediate_tensors is not None:
++        raise ValueError("Partial MoE execution is incompatible with chunking")
++    shape = hidden_states.shape
++    x = hidden_states.reshape(-1, 1, shape[-1])
++    length = x.shape[0]
++    count = torch.tensor([length], dtype=torch.int64, device=x.device)
++    if torch.distributed.get_world_size(self.ep_group) > 1:
++        torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.MAX, group=self.ep_group)
++    padded_length = max(1, int(count.item()))
++    routes = _packed_routes(self, length, padded_length)
++    if padded_length > length:
++        x = F.pad(x, (0, 0, 0, 0, 0, padded_length - length))
++    # Native MoELayer accepts [batch, sequence] masks and transposes internally.
++    mask = None if padding_mask is None else padding_mask.transpose(0, 1).reshape(1, length)
++    if padded_length > length and mask is not None:
++        mask = F.pad(mask, (0, padded_length - length), value=False)
++    outputs = []
++    for start in range(0, padded_length, size):
++        end = min(start + size, padded_length)
++        chunk_routes = None if routes is None else routes[start:end]
++        chunk_mask = None if mask is None else mask[:, start:end]
++
++        def run(part, chunk_routes=chunk_routes, chunk_mask=chunk_mask):
++            with _bind_routes(self.router, chunk_routes):
++                output, bias = self._glm53_original_forward(part, padding_mask=chunk_mask)
++            if bias is not None:
++                raise ValueError("Chunked GLM MoE requires bias-free experts")
++            return output
++
++        outputs.append(_checkpoint(run, x[start:end]))
++    return torch.cat(outputs, dim=0)[:length].reshape(shape), None
++
++
++def _expert_forward(self, x, counts, probs, output_buffer=None, grad_input_buffer=None):
++    size = self._glm53_expert_chunk
++    if not size:
++        return self._glm53_original_forward(x, counts, probs, output_buffer, grad_input_buffer)
++    # One D2H sync instead of counts.max().item() followed by counts.tolist().
++    lengths = counts.tolist()
++    if max(lengths) <= size:
++        return self._glm53_original_forward(x, counts, probs, output_buffer, grad_input_buffer)
++    if output_buffer is not None or grad_input_buffer is not None:
++        raise ValueError("Chunked experts do not support zero-copy output buffers")
++    x_parts = x.split(lengths, dim=0)
++    p_parts = probs.split(lengths, dim=0)
++    outputs = [[] for _ in lengths]
++    for start in range(0, max(lengths), size):
++        sizes = [max(0, min(size, n - start)) for n in lengths]
++        chunk_counts = counts.new_tensor(sizes)
++        chunk_x = torch.cat([v[start:start + n] for v, n in zip(x_parts, sizes)], dim=0)
++        chunk_p = torch.cat([v[start:start + n] for v, n in zip(p_parts, sizes)], dim=0)
++
++        def run(a, p, chunk_counts=chunk_counts):
++            output, bias = self._glm53_original_forward(a, chunk_counts, p)
++            if bias is not None:
++                raise ValueError("Chunked GLM experts require bias-free output")
++            return output
++
++        result = _checkpoint(run, chunk_x, chunk_p)
++        for parts, value in zip(outputs, result.split(sizes, dim=0)):
++            parts.append(value)
++    return torch.cat([torch.cat(parts, dim=0) for parts in outputs], dim=0), None
++
++
++def install_moe_chunking(module, dispatch_chunk=0, expert_chunk=0):
++    """Install on an existing native MoELayer; parameter names remain unchanged."""
++    if dispatch_chunk < 0 or expert_chunk < 0:
++        raise ValueError("Chunk sizes must be nonnegative")
++    if not dispatch_chunk and not expert_chunk:
++        return
++    if hasattr(module, "_glm53_dispatch_chunk"):
++        raise ValueError("MoE chunking is already installed")
++    config = module.config
++    for name in ("fp8", "fp4", "moe_shared_expert_overlap", "moe_expert_capacity_factor",
++                 "moe_pad_expert_input_to_capacity", "moe_router_enable_expert_bias_update",
++                 "overlap_dispatch_backward_with_experts_wgrad", "delay_wgrad_compute"):
++        if getattr(config, name, False):
++            raise ValueError(f"Chunked MoE does not support {name}")
++    for name in ("moe_aux_loss_coeff", "moe_z_loss_coeff", "moe_router_bias_update_rate"):
++        if getattr(config, name, 0):
++            raise ValueError(f"Chunked MoE requires {name}=0")
++    if config.tensor_model_parallel_size != 1 or config.expert_tensor_parallel_size != 1:
++        raise ValueError("Chunked native GLM currently requires TP=ETP=1")
++    if module.moe_layer_recompute or module.experts.activation_recompute:
++        raise ValueError("Use the recipe's full layer recompute, not selective MoE recompute")
++    module._glm53_original_forward = module.forward
++    module._glm53_dispatch_chunk = dispatch_chunk
++    module.forward = MethodType(_moe_forward, module)
++    module.experts._glm53_original_forward = module.experts.forward
++    module.experts._glm53_expert_chunk = expert_chunk
++    module.experts.forward = MethodType(_expert_forward, module.experts)
+diff --git a/slime_plugins/models/glm5_next/moe_weighting.py b/slime_plugins/models/glm5_next/moe_weighting.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6944b8280977b577bb1dfac003c407d04116bc9a
+--- /dev/null
++++ b/slime_plugins/models/glm5_next/moe_weighting.py
+@@ -0,0 +1,82 @@
++"""Apply GLM routed-expert weights at combine, matching NPU inference."""
++
++import copy
++import math
++from types import MethodType
++
++import torch
++
++
++def weighted_sum_fp32(expert_output, token_indices, probabilities, restore_shape):
++    # Inference stores probabilities in the model dtype, but accumulates the
++    # weighted expert outputs in FP32 before rounding the combined token once.
++    weights = probabilities.to(expert_output.dtype).float()
++    weighted = expert_output.float() * weights.unsqueeze(-1)
++    result = torch.zeros(restore_shape, device=expert_output.device, dtype=torch.float32)
++    return result.index_add(0, token_indices.long(), weighted)
++
++
++def _experts_without_weighting(self, x, counts, probs, output_buffer=None, grad_input_buffer=None):
++    return self._glm53_unweighted_original_forward(
++        x, counts, torch.ones_like(probs), output_buffer, grad_input_buffer
++    )
++
++
++def _alltoall_combine_postprocess(self, expert_output):
++    probabilities = self.probs.T.contiguous().masked_select(self.routing_map.T.contiguous())
++    # NPU fused permute returns an inverse map over token-expert assignments,
++    # not source token IDs. Rebuild IDs in the expert-major output order.
++    token_indices = torch.arange(
++        self.routing_map.shape[0], device=expert_output.device,
++    ).expand(self.routing_map.shape[1], -1).masked_select(self.routing_map.T.contiguous())
++    output = weighted_sum_fp32(
++        expert_output, token_indices,
++        probabilities, self.hidden_shape_before_permute,
++    ).to(expert_output.dtype)
++    output = output * self._glm53_routed_scaling_factor
++    return output.view(self.hidden_shape)
++
++
++def _allgather_combine_preprocess(self, expert_output):
++    self._glm53_combined_dtype = expert_output.dtype
++    return weighted_sum_fp32(
++        expert_output, self.reversed_local_input_permutation_mapping,
++        self.local_probs, self.hidden_shape_before_permute,
++    )
++
++
++def _allgather_combine_postprocess(self, output):
++    # The existing ReduceScatter receives FP32 partial sums from preprocess.
++    return (output.to(self._glm53_combined_dtype) * self._glm53_routed_scaling_factor).view(self.hidden_shape)
++
++
++def install_inference_aligned_weighting(module, scaling_factor):
++    """Install before optional chunking, preserving modules and checkpoint keys."""
++    config = module.config
++    if hasattr(module.experts, '_glm53_unweighted_original_forward'):
++        raise ValueError('GLM inference-aligned MoE weighting is already installed')
++    if config.moe_token_dispatcher_type not in ('alltoall', 'allgather'):
++        return
++    if config.tensor_model_parallel_size != 1 or config.expert_tensor_parallel_size != 1:
++        return
++    for name in ('fp8', 'fp4', 'moe_apply_probs_on_input', 'moe_shared_expert_overlap',
++                 'moe_expert_capacity_factor', 'moe_pad_expert_input_to_capacity',
++                 'moe_router_padding_for_quantization'):
++        if getattr(config, name, False):
++            return
++    scale = float(scaling_factor)
++    if not math.isfinite(scale) or scale <= 0:
++        raise ValueError('Routed scaling factor must be finite and positive')
++    # Router config is shared by other modules. Copy it before moving the
++    # scaling factor out of route probabilities and into the combined output.
++    module.router.config = copy.copy(module.router.config)
++    module.router.config.moe_router_topk_scaling_factor = 1.0
++    module.experts._glm53_unweighted_original_forward = module.experts.forward
++    module.experts.forward = MethodType(_experts_without_weighting, module.experts)
++    dispatcher = module.token_dispatcher
++    dispatcher._glm53_routed_scaling_factor = scale
++    if config.moe_token_dispatcher_type == 'alltoall':
++        dispatcher.combine_postprocess = MethodType(_alltoall_combine_postprocess, dispatcher)
++    else:
++        dispatcher.combine_preprocess = MethodType(_allgather_combine_preprocess, dispatcher)
++        dispatcher.combine_postprocess = MethodType(_allgather_combine_postprocess, dispatcher)
+diff --git a/slime_plugins/models/glm5_next/npu_backend.py b/slime_plugins/models/glm5_next/npu_backend.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..92875e28ad771e92a66e31a4dd0121a0b4c98657
+--- /dev/null
++++ b/slime_plugins/models/glm5_next/npu_backend.py
+@@ -0,0 +1,156 @@
++"""Ascend backend for the GLM5-next model.
++
++KDA and causal convolution use AscendC forward/backward bridges. Gated
++normalization shares the inference forward with a training backward; sparse attention uses CANN SparseFlashAttention.
++CP exchanges sequence shards for head shards when the head count is divisible
++by the CP size, and restores the local sequence layout after computation.
++"""
++
++import os
++from types import SimpleNamespace
++
++import torch
++import torch.nn.functional as F
++from megatron.core.tensor_parallel.mappings import all_to_all, gather_from_sequence_parallel_region
++
++from .gated_rmsnorm import FusedRMSNormGated
++from .packed_sequence import packed_boundaries
++
++
++def _boundaries(cu, length):
++    if length <= 0:
++        raise ValueError("Packed input must contain at least one token")
++    return packed_boundaries(cu if cu is not None else [0, length], length)
++
++
++def _gather(x, context):
++    if context is None:
++        return x
++    return gather_from_sequence_parallel_region(x.transpose(0, 1).contiguous(), group=context.group).transpose(0, 1)
++
++
++def _local(x, context):
++    if context is None:
++        return x
++    return x.chunk(context.group.size(), dim=1)[context.group.rank()].contiguous()
++
++
++def _can_shard_heads(x, context):
++    return context is not None and x.shape[0] == 1 and x.shape[2] % context.group.size() == 0
++
++
++def _to_head_parallel(x, context):
++    parts = x.chunk(context.group.size(), dim=2)
++    return all_to_all(context.group, torch.cat(parts, dim=1).squeeze(0)).unsqueeze(0)
++
++
++def _to_sequence_parallel(x, context):
++    exchanged = all_to_all(context.group, x.squeeze(0)).unsqueeze(0)
++    return torch.cat(exchanged.chunk(context.group.size(), dim=1), dim=2).contiguous()
++
++
++def _head_slice(x, context):
++    return x.chunk(context.group.size(), dim=0)[context.group.rank()].contiguous()
++
++
++def build_cp_context(cu_seqlens, group, conv1d_kernel_size):
++    return SimpleNamespace(cu_seqlens=cu_seqlens, group=group)
++
++
++def _convolve(x, weight, activation, cu):
++    if x.device.type == "npu" and x.dtype in (torch.bfloat16, torch.float16):
++        from .ascendc_conv1d import causal_conv1d_ascendc
++
++        return causal_conv1d_ascendc(x, weight, activation, cu)
++    return _convolve_torch(x, weight, activation, cu)
++
++
++def _convolve_torch(x, weight, activation, cu):
++    outputs = []
++    # Cast once so gradients from packed sequences accumulate in FP32 before
++    # the final weight-gradient cast, just as in the fused convolution.
++    fused_silu = activation == "silu" and x.dtype in (torch.bfloat16, torch.float16)
++    conv_weight = weight.to(x.dtype).float() if fused_silu else weight
++    for start, end in zip((bounds := _boundaries(cu, x.shape[1]))[:-1], bounds[1:], strict=True):
++        if start == end:
++            continue
++        part = x[:, start:end].transpose(1, 2)
++        # Match fused inference: round only after SiLU, with casts in autograd.
++        if fused_silu:
++            part = part.float()
++        part = F.pad(part, (weight.shape[-1] - 1, 0))
++        part = F.conv1d(part, conv_weight[:, None], groups=weight.shape[0]).transpose(1, 2)
++        if activation == "silu":
++            part = F.silu(part)
++        elif activation is not None:
++            raise ValueError(f"Unsupported convolution activation: {activation}")
++        outputs.append(part.to(x.dtype))
++    return torch.cat(outputs, dim=1)
++
++
++class ShortConvolution(torch.nn.Module):
++    def __init__(self, hidden_size, kernel_size, bias=False, activation="silu"):
++        super().__init__()
++        if bias:
++            raise ValueError("GLM5-next NPU convolution expects bias=False")
++        self.kernel_size = (kernel_size,)
++        self.activation = activation
++        self.weight = torch.nn.Parameter(torch.empty(hidden_size, 1, kernel_size))
++        torch.nn.init.normal_(self.weight, std=0.02)
++
++    def forward(self, x, cu_seqlens=None):
++        return _convolve(x, self.weight.squeeze(1), self.activation, cu_seqlens), None
++
++
++def causal_conv1d(x, weight, activation, cp_context):
++    if _can_shard_heads(x, cp_context):
++        out = _convolve(
++            _to_head_parallel(x, cp_context), _head_slice(weight, cp_context), activation, cp_context.cu_seqlens
++        )
++        return _to_sequence_parallel(out, cp_context), None
++    cu_seqlens = cp_context.cu_seqlens if cp_context is not None else None
++    out = _convolve(_gather(x, cp_context), weight, activation, cu_seqlens)
++    return _local(out, cp_context), None
++
++
++def chunk_kda(q, k, v, *, g, beta, cu_seqlens, cp_context=None, **kwargs):
++    from .ascendc_kda import chunk_kda_ascendc
++
++    shard_heads = _can_shard_heads(q, cp_context)
++    if shard_heads:
++        heads = q.shape[2]
++        if kwargs.get("A_log") is not None:
++            kwargs["A_log"] = _head_slice(kwargs["A_log"], cp_context)
++        if kwargs.get("dt_bias") is not None:
++            kwargs["dt_bias"] = _head_slice(kwargs["dt_bias"].reshape(heads, -1), cp_context).flatten()
++        q, k, v, g, beta = [_to_head_parallel(x, cp_context) for x in (q, k, v, g, beta)]
++    else:
++        q, k, v, g, beta = [_gather(x, cp_context).contiguous() for x in (q, k, v, g, beta)]
++
++    def local_output(out):
++        return _to_sequence_parallel(out, cp_context) if shard_heads else _local(out, cp_context)
++
++    cpu_bounds = kwargs.pop("cu_seqlens_cpu", None)
++    bounds = _boundaries(cpu_bounds if cpu_bounds is not None else cu_seqlens, q.shape[1])
++    mode = os.getenv("GLM53_KDA_SEQUENCE_MODE", "loop")
++    if mode not in ("loop", "packed"):
++        raise ValueError(f"Unsupported GLM53_KDA_SEQUENCE_MODE: {mode}")
++    if mode == "packed":
++        # Remove empty sequences without changing token positions.
++        bounds = list(dict.fromkeys(bounds))
++        out, _ = chunk_kda_ascendc(q, k, v, g=g, beta=beta, cu_seqlens=bounds, **kwargs)
++        return local_output(out), None
++    outputs = []
++    for start, end in zip(bounds[:-1], bounds[1:], strict=True):
++        if start == end:
++            continue
++        out, _ = chunk_kda_ascendc(
++            q[:, start:end],
++            k[:, start:end],
++            v[:, start:end],
++            g=g[:, start:end],
++            beta=beta[:, start:end],
++            **kwargs,
++        )
++        outputs.append(out)
++    return local_output(torch.cat(outputs, dim=1)), None
+diff --git a/slime_plugins/models/glm5_next/ops.py b/slime_plugins/models/glm5_next/ops.py
+index 46adb03403f887fb2fb41432367cd90fb3c1b442..03152ddfd386317ff66e8f3b717ddb5f10fbea31 100644
+--- a/slime_plugins/models/glm5_next/ops.py
++++ b/slime_plugins/models/glm5_next/ops.py
+@@ -3,19 +3,48 @@
+ import torch
+ import torch.nn.functional as F
+ 
++from .packed_sequence import packed_boundaries
++
++
++def swiglu_with_limit(x, limit):
++    """Clamped SwiGLU with FP32 arithmetic and the original output dtype."""
++    gate, up = x.float().chunk(2, dim=-1)
++    gate = gate.clamp(max=limit)
++    up = up.clamp(-limit, limit)
++    return (F.silu(gate) * up).to(x.dtype)
++
+ 
+ class ClampedSwiGLU(torch.nn.Module):
+     def __init__(self, config):
+         super().__init__()
+         self.limit = config.activation_func_clamp_value
+ 
+-    @torch.compile(dynamic=True)
+     def forward(self, x):
+-        gate, up = x.float().chunk(2, dim=-1)
+-        return (F.silu(gate.clamp(max=self.limit)) * up.clamp(-self.limit, self.limit)).to(x.dtype)
++        if x.device.type == "npu":
++            return swiglu_with_limit(x, self.limit)
++        return self._compiled_forward(x)
++
++    @torch.compile(dynamic=True)
++    def _compiled_forward(self, x):
++        return self._forward(x)
++
++    def _forward(self, x):
++        return swiglu_with_limit(x, self.limit)
++
++
++def _use_fused_mhc(x):
++    return x.device.type == "npu" and x.dtype == torch.bfloat16
+ 
+ 
+ def mhc_pre(x, weight, scale, bias, n, norm_eps, eps, iterations):
++    if _use_fused_mhc(x) and n == 4 and iterations == 20:
++        from .ascendc_mhc import mhc_pre_ascendc
++
++        return mhc_pre_ascendc(x, weight, scale, bias, n, norm_eps, eps, iterations)
++    return _mhc_pre_reference(x, weight, scale, bias, n, norm_eps, eps, iterations)
++
++
++def _mhc_pre_reference(x, weight, scale, bias, n, norm_eps, eps, iterations):
+     """Aggregate residual streams and compute the Sinkhorn mixing matrix.
+ 
+     The projection precedes RMS scaling, and the first Sinkhorn iteration
+@@ -38,6 +67,14 @@ def mhc_pre(x, weight, scale, bias, n, norm_eps, eps, iterations):
+ 
+ 
+ def mhc_post(y, x, post, residual):
++    if _use_fused_mhc(x) and post.shape[-1] == 4:
++        from .ascendc_mhc import mhc_post_ascendc
++
++        return mhc_post_ascendc(y, x, post, residual)
++    return _mhc_post_reference(y, x, post, residual)
++
++
++def _mhc_post_reference(y, x, post, residual):
+     n = post.shape[-1]
+     streams = x.float().unflatten(-1, (n, -1))
+     output = residual.transpose(-1, -2) @ streams
+@@ -54,7 +91,11 @@ def pooled_indexer_topk(q, k, weights, gates, ape, cu_seqlens, topk, pool_size,
+     storage independently of the total sequence length. Indexer parameters
+     are frozen, as in the reference RL recipe.
+     """
+-    boundaries = cu_seqlens.tolist()
++    if pool_size <= 0 or topk <= 0 or topk % pool_size:
++        raise ValueError("KPool topk must be positive and divisible by pool_size")
++    if query_start < 0 or query_start + q.shape[0] > k.shape[0]:
++        raise ValueError("KPool query interval lies outside the packed stream")
++    boundaries = packed_boundaries(cu_seqlens, k.shape[0])
+     width = ((topk + pool_size - 1 + 63) // 64) * 64
+     indices = torch.full((q.shape[0], 1, width), -1, dtype=torch.int32, device=q.device)
+     offsets = torch.arange(pool_size, device=q.device)
+diff --git a/slime_plugins/models/glm5_next/packed_sequence.py b/slime_plugins/models/glm5_next/packed_sequence.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d621dec35df3b81b30c10a87febb7963101ea98f
+--- /dev/null
++++ b/slime_plugins/models/glm5_next/packed_sequence.py
+@@ -0,0 +1,16 @@
++"""Packed document offsets shared by the GLM-5.3 operator adapters."""
++
++
++def packed_boundaries(offsets, token_count):
++    """Return integer offsets covering the stream, including empty documents."""
++    try:
++        values = offsets.tolist() if hasattr(offsets, "tolist") else list(offsets)
++    except TypeError as exc:
++        raise ValueError("Expected a one-dimensional sequence of integer offsets") from exc
++    if not isinstance(values, list) or len(values) < 2 or any(type(value) is not int for value in values):
++        raise ValueError("Expected a one-dimensional sequence of at least two integer offsets")
++    if values[0] != 0 or values[-1] != token_count:
++        raise ValueError(f"Packed boundaries must cover {token_count} tokens")
++    if any(end < start for start, end in zip(values, values[1:])):
++        raise ValueError("Packed boundaries must be nondecreasing")
++    return values
+diff --git a/slime_plugins/models/glm5_next/processing.py b/slime_plugins/models/glm5_next/processing.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ba5193f137f331f328cce8f3049e46418021addf
+--- /dev/null
++++ b/slime_plugins/models/glm5_next/processing.py
+@@ -0,0 +1,11 @@
++from transformers.models.glm5_next.processing_glm5_next import Glm5NextProcessor as ServingGlm5NextProcessor
++
++
++class Glm5NextProcessor(ServingGlm5NextProcessor):
++    """Training uses exactly the same image expansion as rollout serving."""
++
++    def __call__(self, *args, **kwargs):
++        output = super().__call__(*args, **kwargs)
++        if "pixel_values_videos" in output:
++            raise NotImplementedError("GLM53 training processor currently supports images, not videos")
++        return output
+diff --git a/slime_plugins/models/glm5_next/router.py b/slime_plugins/models/glm5_next/router.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..65331f20b1bbdd726106969dd04225309b48b432
+--- /dev/null
++++ b/slime_plugins/models/glm5_next/router.py
+@@ -0,0 +1,23 @@
++"""GLM5-next router projection aligned with the default NPU inference path."""
++
++from types import MethodType
++
++import torch
++import torch.nn.functional as F
++
++
++def inference_aligned_gating(self, hidden_states):
++    # Inference rounds the linear projection to the model dtype, then promotes
++    # logits for FP32 sigmoid, correction bias, and top-k weight normalization.
++    # Cast views only: keep parameter storage and optimizer gradients intact.
++    weight = self.weight.to(device=hidden_states.device, dtype=hidden_states.dtype)
++    bias = self.bias
++    if bias is not None:
++        bias = bias.to(device=hidden_states.device, dtype=hidden_states.dtype)
++    flat = hidden_states.reshape(-1, hidden_states.shape[-1])
++    logits = F.linear(flat, weight, bias)
++    return logits.reshape(*hidden_states.shape[:-1], -1).float()
++
++
++def install_inference_aligned_router(router):
++    router.gating = MethodType(inference_aligned_gating, router)
+diff --git a/slime_plugins/models/glm5_next/vision.py b/slime_plugins/models/glm5_next/vision.py
+index 4098d0ec1ea8d6f3174f64392cf10d854604b787..2a84636936fa83952a00f97554493999b4b47add 100644
+--- a/slime_plugins/models/glm5_next/vision.py
++++ b/slime_plugins/models/glm5_next/vision.py
+@@ -1,7 +1,10 @@
+ """Checkpoint-compatible CogViT using the Transformers GLM-OCR building blocks."""
+ 
++import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
++from slime.utils import accelerator
++from transformers.modeling_outputs import BaseModelOutputWithPooling
+ from transformers.models.glm_ocr.modeling_glm_ocr import (
+     GlmOcrVisionBlock,
+     GlmOcrVisionMlp,
+@@ -11,22 +14,54 @@ from transformers.models.glm_ocr.modeling_glm_ocr import (
+ )
+ 
+ from .attention import RMSNorm
++from .ops import swiglu_with_limit
++
++
++def vision_swiglu_with_limit(x, limit):
++    if x.device.type == "npu":
++        # Inference disables torch.compile on NPU. Match its eager rounding
++        # at each operation, including the BF16 SiLU intermediate.
++        gate, up = x.chunk(2, dim=-1)
++        return F.silu(gate.clamp(max=limit)) * up.clamp(-limit, limit)
++    # Preserve the FP32 intermediates used by compiled inference elsewhere.
++    return swiglu_with_limit(x, limit)
++
++
++class Glm5NextVisionRMSNorm(RMSNorm):
++    def forward(self, x):
++        if x.device.type == "npu":
++            import torch_npu
++
++            return torch_npu.npu_rms_norm(x, self.weight, self.eps)[0]
++        return super().forward(x)
+ 
+ 
+ class Glm5NextVisionBlock(GlmOcrVisionBlock):
+     def __init__(self, config):
+         super().__init__(config)
+-        self.norm1 = RMSNorm(config.hidden_size, config.rms_norm_eps)
+-        self.norm2 = RMSNorm(config.hidden_size, config.rms_norm_eps)
+-        # SGLang's VisionAttention uses the per-head default epsilon.
+-        self.attn.q_norm = RMSNorm(config.hidden_size // config.num_heads, 1e-6)
+-        self.attn.k_norm = RMSNorm(config.hidden_size // config.num_heads, 1e-6)
++        self.norm1 = Glm5NextVisionRMSNorm(config.hidden_size, config.rms_norm_eps)
++        self.norm2 = Glm5NextVisionRMSNorm(config.hidden_size, config.rms_norm_eps)
++        # NPU Q/K normalization uses the model epsilon; GPU uses 1e-6.
++        qk_norm_eps = config.rms_norm_eps if accelerator.device_type() == "npu" else 1e-6
++        if accelerator.device_type() == "npu":
++            from .vision_attention import Glm5NextVisionAttention
++
++            self.attn = Glm5NextVisionAttention(config)
++        self.attn.q_norm = Glm5NextVisionRMSNorm(config.hidden_size // config.num_heads, qk_norm_eps)
++        self.attn.k_norm = Glm5NextVisionRMSNorm(config.hidden_size // config.num_heads, qk_norm_eps)
+         self.mlp = Glm5NextVisionMLP(config)
+ 
+     def forward(self, hidden_states, cu_seqlens, position_embeddings=None, **kwargs):
+         attention = self.attn(
+             self.norm1(hidden_states), cu_seqlens=cu_seqlens, position_embeddings=position_embeddings, **kwargs
+         )
++        if hidden_states.device.type == "npu":
++            import torch_npu
++
++            normalized, _, residual = torch_npu.npu_add_rms_norm(
++                hidden_states, attention, self.norm2.weight, self.norm2.eps
++            )
++            return residual + self.mlp(normalized)
+         # Match the fused residual-add/RMSNorm: normalize the FP32 sum,
+         # while the residual branch itself is stored in the model dtype.
+         residual = hidden_states.float() + attention.float()
+@@ -40,21 +75,64 @@ class Glm5NextVisionMLP(GlmOcrVisionMlp):
+         self.limit = config.swiglu_limit
+ 
+     def forward(self, x):
+-        gate = self.gate_proj(x).float().clamp(max=self.limit)
+-        up = self.up_proj(x).float().clamp(-self.limit, self.limit)
+-        return self.down_proj((F.silu(gate) * up).to(x.dtype))
++        if x.device.type == "npu":
++            # Match inference's packed gate/up GEMM shape and BF16 rounding.
++            # Concatenation preserves checkpoint keys and autograd to both
++            # parameters; no detached or duplicated trainable weights.
++            weight = torch.cat((self.gate_proj.weight, self.up_proj.weight), dim=0)
++            bias = torch.cat((self.gate_proj.bias, self.up_proj.bias), dim=0)
++            gate_up = F.linear(x, weight, bias)
++        else:
++            gate_up = torch.cat((self.gate_proj(x), self.up_proj(x)), dim=-1)
++        return self.down_proj(vision_swiglu_with_limit(gate_up, self.limit))
++
++
++class Glm5NextVisionLayerNorm(nn.LayerNorm):
++    """Match inference LayerNorm precision while preserving checkpoint keys."""
++
++    def forward(self, x):
++        return F.layer_norm(
++            x.float(), self.normalized_shape,
++            self.weight.float() if self.weight is not None else None,
++            self.bias.float() if self.bias is not None else None,
++            self.eps,
++        ).to(x.dtype)
+ 
+ 
+ class Glm5NextVisionMerger(GlmOcrVisionPatchMerger):
+     def __init__(self, config):
+         super().__init__(config.out_hidden_size, config.projection_intermediate_size, config.hidden_act)
++        self.post_projection_norm = Glm5NextVisionLayerNorm(
++            self.post_projection_norm.normalized_shape, eps=1e-6
++        )
+         self.limit = config.swiglu_limit
++        # Store one trainable matrix, in inference's [gate; up] order. No
++        # weight concatenation or duplicated parameters in the forward path.
++        assert self.gate_proj.bias is None and self.up_proj.bias is None
++        self.gate_up_proj = nn.Linear(
++            self.gate_proj.in_features, 2 * self.gate_proj.out_features, bias=False,
++            device=self.gate_proj.weight.device, dtype=self.gate_proj.weight.dtype,
++        )
++        with torch.no_grad():
++            self.gate_up_proj.weight.copy_(torch.cat((self.gate_proj.weight, self.up_proj.weight), dim=0))
++        del self.gate_proj, self.up_proj
++
++    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
++                              missing_keys, unexpected_keys, error_msgs):
++        # Accept legacy plain PyTorch/HF state dicts as well as new packed
++        # state dicts. The streaming HF loader has the same conversion.
++        packed = prefix + "gate_up_proj.weight"
++        gate, up = prefix + "gate_proj.weight", prefix + "up_proj.weight"
++        if packed not in state_dict and gate in state_dict and up in state_dict:
++            state_dict[packed] = torch.cat((state_dict.pop(gate), state_dict.pop(up)), dim=0)
++        super()._load_from_state_dict(
++            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
++        )
+ 
+     def forward(self, x):
+         x = self.act1(self.post_projection_norm(self.proj(x)))
+-        gate = self.gate_proj(x).float().clamp(max=self.limit)
+-        up = self.up_proj(x).float().clamp(-self.limit, self.limit)
+-        return self.down_proj((F.silu(gate) * up).to(x.dtype))
++        gate_up = self.gate_up_proj(x)
++        return self.down_proj(vision_swiglu_with_limit(gate_up, self.limit))
+ 
+ 
+ class Glm5NextPatchEmbed(GlmOcrVisionPatchEmbed):
+@@ -62,22 +140,46 @@ class Glm5NextPatchEmbed(GlmOcrVisionPatchEmbed):
+         # Every input is exactly one non-overlapping Conv3d patch. GEMM
+         # implements the same contraction without cuDNN's BF16 Conv3d fallback.
+         patches = hidden_states.reshape(-1, self.proj.weight[0].numel()).to(self.proj.weight.dtype)
+-        # SGLang's Conv3dLayer uses this same GEMM and fused bias epilogue.
+         return F.linear(patches, self.proj.weight.flatten(1), self.proj.bias)
+ 
+ 
+ class Glm5NextVisionModel(GlmOcrVisionModel):
+     def __init__(self, config):
++        if accelerator.device_type() == "npu":
++            config._attn_implementation = "sdpa"
+         super().__init__(config)
+         self.patch_embed = Glm5NextPatchEmbed(config)
+         self.merger = Glm5NextVisionMerger(config)
+         self.blocks = nn.ModuleList([Glm5NextVisionBlock(config) for _ in range(config.depth)])
+-        self.post_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
++        self.post_layernorm = Glm5NextVisionRMSNorm(config.hidden_size, config.rms_norm_eps)
++        if accelerator.device_type() == "npu":
++            # Use one FP32 frequency table regardless of the construction device.
++            rotary = self.rotary_pos_emb
++            with torch.device("cpu"):
++                inv_freq, _ = rotary.compute_axial_rope_parameters(rotary.config, device="cpu")
++            rotary.inv_freq = inv_freq.to(rotary.inv_freq.device)
++            rotary.original_inv_freq = rotary.inv_freq.clone()
++
++    def forward(self, hidden_states, grid_thw, **kwargs):
++        # Keep GEMM shapes independent of rollout batching and training packing.
++        if hidden_states.device.type != "npu" or len(grid_thw) <= 1:
++            return super().forward(hidden_states, grid_thw, **kwargs)
++        counts = grid_thw.prod(dim=-1).tolist()
++        outputs = [
++            super(Glm5NextVisionModel, self).forward(pixels, grid_thw[i : i + 1], **kwargs)
++            for i, pixels in enumerate(hidden_states.split(counts))
++        ]
++        return BaseModelOutputWithPooling(
++            last_hidden_state=torch.cat([x.last_hidden_state for x in outputs]),
++            pooler_output=torch.cat([x.pooler_output for x in outputs]),
++        )
+ 
+     def _apply(self, fn, recurse=True):
+         # Frequencies are not checkpoint parameters. Preserve their original
+         # FP32 values when Megatron casts the model weights to BF16.
+-        inv_freq = self.rotary_pos_emb.inv_freq
++        rotary = self.rotary_pos_emb
++        frequencies = {name: getattr(rotary, name) for name in ("inv_freq", "original_inv_freq")}
+         super()._apply(fn, recurse=recurse)
+-        self.rotary_pos_emb.inv_freq = inv_freq.to(device=self.rotary_pos_emb.inv_freq.device)
++        for name, frequency in frequencies.items():
++            setattr(rotary, name, frequency.to(device=getattr(rotary, name).device))
+         return self
+diff --git a/tests/test_glm5_next_ascendc_conv1d.py b/tests/test_glm5_next_ascendc_conv1d.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9d740722b86e41833dbf630fb7cfd06b097991cb
+--- /dev/null
++++ b/tests/test_glm5_next_ascendc_conv1d.py
+@@ -0,0 +1,53 @@
++"""NPU numerical regression tests for the GLM5-next fused causal convolution."""
++
++import pytest
++import torch
++import torch.nn.functional as F
++
++pytest.importorskip("torch_npu")
++pytestmark = pytest.mark.skipif(not torch.npu.is_available(), reason="requires an Ascend NPU")
++from slime_plugins.models.glm5_next import ascendc_conv1d as _module
++
++
++def reference(x, weight, activation, boundaries):
++    outputs = []
++    for start, end in zip(boundaries[:-1], boundaries[1:], strict=False):
++        if start == end:
++            continue
++        y = F.conv1d(
++            F.pad(x[:, start:end].transpose(1, 2), (weight.shape[-1] - 1, 0)), weight[:, None], groups=weight.shape[0]
++        ).transpose(1, 2)
++        outputs.append(F.silu(y) if activation else y)
++    return torch.cat(outputs, dim=1)
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
++@pytest.mark.parametrize("case", ["dense", "packed", "short", "empty_segment", "full_width"])
++def test_forward_backward(dtype, case):
++    torch.manual_seed(53)
++    batch, length, channels = (2, 129, 128) if case == "dense" else (1, 257, 128)
++    boundaries = [0, length]
++    if case == "packed":
++        boundaries = [0, 1, 17, 128, length]
++    if case == "short":
++        length, boundaries = 2, [0, 1, 2]
++    if case == "empty_segment":
++        boundaries = [0, 0, 37, 37, length]
++    if case == "full_width":
++        length, channels, boundaries = 1024, 8192, [0, 333, 1024]
++    x = (torch.randn(batch, length, channels, device="npu", dtype=dtype) * 0.2).requires_grad_()
++    w = (torch.randn(channels, 4, device="npu", dtype=dtype) * 0.2).requires_grad_()
++    xr, wr = x.detach().clone().requires_grad_(), w.detach().clone().requires_grad_()
++    dy = torch.randn_like(x) * 0.2
++    actual = _module.causal_conv1d_ascendc(
++        x, w, "silu", None if case == "dense" else torch.tensor(boundaries, dtype=torch.int32)
++    )
++    expect = reference(xr, wr, "silu", boundaries)
++    actual.backward(dy)
++    expect.backward(dy)
++    torch.npu.synchronize()
++    for name, a, b in [("output", actual, expect), ("dx", x.grad, xr.grad), ("dw", w.grad, wr.grad)]:
++        af, bf = a.float(), b.float()
++        relative_rms = ((af - bf).square().mean().sqrt() / bf.square().mean().sqrt().clamp_min(1e-8)).item()
++        assert torch.isfinite(a).all()
++        assert relative_rms < (0.025 if dtype == torch.bfloat16 else 0.005)
+diff --git a/tests/test_glm5_next_ascendc_mhc.py b/tests/test_glm5_next_ascendc_mhc.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e1f0127ee02d76c849b6b24518820557ab96167c
+--- /dev/null
++++ b/tests/test_glm5_next_ascendc_mhc.py
+@@ -0,0 +1,37 @@
++"""Numerical forward/backward checks for CANN GLM5-next mHC."""
++
++import pytest
++import torch
++
++pytest.importorskip("torch_npu")
++pytestmark = pytest.mark.skipif(not torch.npu.is_available(), reason="requires NPU")
++from slime_plugins.models.glm5_next import ascendc_mhc as fused, ops as ref
++
++
++@pytest.mark.parametrize("tokens,batch", [(8, 1), (65, 2), (1024, 1)])
++def test_mhc_forward_backward(tokens, batch):
++    torch.manual_seed(53)
++    n, d = 4, 4096
++    x = torch.randn(tokens, batch, n * d, device="npu", dtype=torch.bfloat16).requires_grad_()
++    w = (torch.randn(n * n + 2 * n, n * d, device="npu", dtype=torch.bfloat16) * 0.01).requires_grad_()
++    scale = torch.tensor([0.1, 0.2, 0.3], device="npu", dtype=torch.float32, requires_grad=True)
++    bias = (torch.randn(24, device="npu", dtype=torch.float32) * 0.1).requires_grad_()
++    y = torch.randn(tokens, batch, d, device="npu", dtype=torch.bfloat16).requires_grad_()
++    args = [x, w, scale, bias, y]
++    baseline = [v.detach().clone().requires_grad_() for v in args]
++    expected = ref._mhc_pre_reference(*baseline[:4], n, 1e-5, 1e-6, 20)
++    actual = fused.mhc_pre_ascendc(*args[:4], n, 1e-5, 1e-6, 20)
++    final = fused.mhc_post_ascendc(y, x, actual[1], actual[2])
++    assert final._base is None, "pipeline output must be viewless"
++    final_ref = ref._mhc_post_reference(baseline[4], baseline[0], expected[1], expected[2])
++    grad_out = [torch.randn_like(v) * 0.1 for v in (*actual, final)]
++    torch.autograd.backward((*actual, final), grad_out)
++    torch.autograd.backward((*expected, final_ref), grad_out)
++    torch.npu.synchronize()
++    pairs = list(zip(("collapsed", "post", "residual", "merged"), (*actual, final), (*expected, final_ref)))
++    pairs += [(name, a.grad, b.grad) for name, a, b in zip(("dx", "dw", "dscale", "dbias", "dy"), args, baseline)]
++    for name, a, b in pairs:
++        a, b = a.float(), b.float()
++        rel = ((a - b).square().mean().sqrt() / b.square().mean().sqrt().clamp_min(1e-8)).item()
++        assert torch.isfinite(a).all()
++        assert rel < 0.001, (name, rel)
+diff --git a/tests/test_glm5_next_compatibility.py b/tests/test_glm5_next_compatibility.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..833e19ad1f4bbd61aa85b6bb066cfb0fb8793d34
+--- /dev/null
++++ b/tests/test_glm5_next_compatibility.py
+@@ -0,0 +1,138 @@
++"""Tests for model backend selection and request validation."""
++
++import ast
++import builtins
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from slime_plugins.models.glm5_next.packed_sequence import packed_boundaries
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def load_definitions(relative_path, names, namespace):
++    tree = ast.parse((ROOT / relative_path).read_text())
++    tree.body = [node for node in tree.body if getattr(node, "name", None) in names]
++    exec(compile(tree, relative_path, "exec"), namespace)
++    return namespace
++
++
++@pytest.mark.parametrize("backend", ["npu", "cuda", "cpu"])
++@pytest.mark.parametrize("setting", [None, "auto", "npu", "cuda"])
++def test_attention_uses_framework_backend(monkeypatch, backend, setting):
++    if setting is None:
++        monkeypatch.delenv("SLIME_ACCELERATOR", raising=False)
++    else:
++        monkeypatch.setenv("SLIME_ACCELERATOR", setting)
++    path = ROOT / "slime_plugins/models/glm5_next/attention.py"
++    node = next(node for node in ast.parse(path.read_text()).body if isinstance(node, ast.If))
++    imported = []
++
++    def import_backend(name, globals=None, locals=None, fromlist=(), level=0):
++        imported.append(name)
++        return SimpleNamespace(**{name: object() for name in fromlist})
++
++    ns = dict(
++        accelerator=SimpleNamespace(device_type=lambda: backend),
++        __builtins__={**vars(builtins), "__import__": import_backend},
++    )
++    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), ns)
++    assert ("npu_backend" in imported) == (backend == "npu")
++    assert ("fla.modules" in imported) == (backend != "npu")
++
++
++@pytest.mark.parametrize("backend,expected", [("npu", 1e-5), ("cuda", 1e-6), ("cpu", 1e-6)])
++def test_vision_normalization_uses_framework_backend(backend, expected):
++    path = ROOT / "slime_plugins/models/glm5_next/vision.py"
++    tree = ast.parse(path.read_text())
++    node = next(
++        node
++        for node in ast.walk(tree)
++        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "qk_norm_eps" for t in node.targets)
++    )
++    ns = dict(accelerator=SimpleNamespace(device_type=lambda: backend), config=SimpleNamespace(rms_norm_eps=1e-5))
++    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), ns)
++    assert ns["qk_norm_eps"] == expected
++
++
++@pytest.mark.parametrize("boundaries", [[], [0], [0, 8, 4, 12], [1, 12], [0, 13], [0, 1.5, 12], [False, 12], [[0, 12]], 12])
++def test_invalid_packed_boundaries(boundaries):
++    with pytest.raises(ValueError):
++        packed_boundaries(boundaries, 12)
++
++
++def test_empty_packed_sequences_preserve_token_offsets():
++    assert packed_boundaries([0, 0, 4, 4, 12], 12) == [0, 0, 4, 4, 12]
++    ns = load_definitions(
++        "slime_plugins/models/glm5_next/npu_backend.py", {"_boundaries"}, {"packed_boundaries": packed_boundaries}
++    )
++    assert ns["_boundaries"](None, 12) == [0, 12]
++
++
++def test_kpool_rejects_fractional_offsets_before_kernel():
++    import torch
++    from slime_plugins.models.glm5_next.sglang_kpool import pooled_indexer_topk
++
++    q = torch.empty(3, 1, 128, dtype=torch.bfloat16)
++    k = torch.empty(3, 128, dtype=q.dtype)
++    offsets = torch.tensor([0.0, 1.5, 3.0])
++    with pytest.raises(ValueError, match="integer offsets"):
++        pooled_indexer_topk(q, k, None, None, None, offsets, 4, 2)
++
++
++def test_conv1d_missing_fla_bindings_reports_install_hint(monkeypatch):
++    import sys
++    from slime_plugins.models.glm5_next.ascendc_conv1d import _load_ops
++
++    monkeypatch.setitem(sys.modules, "fla_npu.ops.ascendc", None)
++    _load_ops.cache_clear()
++    with pytest.raises(ImportError, match="bde95747") as error:
++        _load_ops()
++    assert isinstance(error.value.__cause__, ImportError)
++
++
++def test_convolution_without_cp_context():
++    calls = []
++    ns = load_definitions(
++        "slime_plugins/models/glm5_next/npu_backend.py",
++        {"causal_conv1d"},
++        dict(
++            _can_shard_heads=lambda *a: False,
++            _gather=lambda x, c: x,
++            _local=lambda x, c: x,
++            _convolve=lambda *args: calls.append(args) or "output",
++        ),
++    )
++    assert ns["causal_conv1d"]("input", "weight", "silu", None) == ("output", None)
++    assert calls == [("input", "weight", "silu", None)]
++
++
++@pytest.mark.parametrize("device,dtype,expected", [("cpu", "bfloat16", False), ("npu", "float32", False), ("npu", "bfloat16", True)])
++def test_fused_mhc_requires_npu_bfloat16(device, dtype, expected):
++    import torch
++
++    ns = load_definitions("slime_plugins/models/glm5_next/ops.py", {"_use_fused_mhc"}, {"torch": torch})
++    tensor = SimpleNamespace(device=SimpleNamespace(type=device), dtype=getattr(torch, dtype))
++    assert ns["_use_fused_mhc"](tensor) is expected
++
++
++@pytest.mark.parametrize(
++    "setting,selected,direct",
++    [("npu", "npu", True), ("auto", "npu", True), (None, "npu", True), ("cuda", "cuda", False)],
++)
++def test_r3_uses_selected_accelerator(monkeypatch, setting, selected, direct):
++    if setting is None:
++        monkeypatch.delenv("SLIME_ACCELERATOR", raising=False)
++    else:
++        monkeypatch.setenv("SLIME_ACCELERATOR", setting)
++    tree = ast.parse((ROOT / "slime/rollout/sglang_rollout.py").read_text())
++    generate = next(node for node in tree.body if getattr(node, "name", None) == "generate")
++    branch = next(node for node in generate.body if isinstance(node, ast.If) and "/workers" in ast.unparse(node))
++    scope = dict(
++        accelerator=SimpleNamespace(device_type=lambda: selected), args=SimpleNamespace(use_rollout_routing_replay=True)
++    )
++    assert eval(compile(ast.Expression(branch.test), "<r3>", "eval"), scope) is direct
++    scope["args"].use_rollout_routing_replay = False
++    assert not eval(compile(ast.Expression(branch.test), "<r3>", "eval"), scope)
+diff --git a/tests/test_glm5_next_kda_reference.py b/tests/test_glm5_next_kda_reference.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c5faf98ac3baaaa7942de5cfe6fd15d73b92e29f
+--- /dev/null
++++ b/tests/test_glm5_next_kda_reference.py
+@@ -0,0 +1,58 @@
++"""Compare packed KDA and per-document KDA with an independent FP32 recurrence."""
++
++import os
++
++import pytest
++import torch
++import torch.nn.functional as F
++
++
++def recurrent_kda(q, k, v, gate, beta, offsets):
++    result = []
++    for first, last in zip(offsets, offsets[1:]):
++        state = q.new_zeros(q.size(2), k.size(-1), v.size(-1))
++        for t in range(first, last):
++            key = k[0, t]
++            state = state * gate[0, t].exp().unsqueeze(-1)
++            residual = v[0, t] - torch.einsum("hk,hkv->hv", key, state)
++            state = state + key.unsqueeze(-1) * (beta[0, t, :, None] * residual).unsqueeze(-2)
++            result.append(torch.einsum("hk,hkv->hv", q[0, t], state) * q.size(-1) ** -0.5)
++    return torch.stack(result).unsqueeze(0)
++
++
++@pytest.mark.skipif(os.getenv("GLM53_TEST_NPU") != "1", reason="requires an idle Ascend NPU")
++@pytest.mark.parametrize("mode", ["packed", "loop"])
++def test_kda_output_and_gradients(monkeypatch, mode):
++    pytest.importorskip("torch_npu")
++    from slime_plugins.models.glm5_next.npu_backend import chunk_kda
++
++    monkeypatch.setenv("GLM53_KDA_SEQUENCE_MODE", mode)
++    rng = torch.Generator().manual_seed(142)
++    shape = (1, 102, 8, 128)
++    q, k = [F.normalize(torch.randn(shape, generator=rng), dim=-1).bfloat16() for _ in range(2)]
++    v = torch.randn(shape, generator=rng).bfloat16()
++    gate = -torch.rand(shape, generator=rng)
++    beta = torch.rand(shape[:-1], generator=rng)
++    offsets = [0, 65, 102]
++    inputs = [q, k, v, gate, beta]
++    ref = [x.float().requires_grad_() for x in inputs]
++    native = [x.npu().requires_grad_() for x in inputs]
++    expected = recurrent_kda(*ref, offsets)
++    actual, _ = chunk_kda(*native[:3], g=native[3], beta=native[4], cu_seqlens=offsets)
++    grad = torch.randn(shape, generator=rng).bfloat16()
++    ref_grad = torch.autograd.grad(expected, ref, grad.float())
++    actual_grad = torch.autograd.grad(actual, native, grad.npu())
++    for name, calculated, reference in zip(
++        ("out", "dq", "dk", "dv", "dg", "dbeta"), (actual, *actual_grad), (expected, *ref_grad), strict=True
++    ):
++        value = calculated.detach().float().cpu()
++        relative_error = (value - reference.detach()).norm() / reference.detach().norm().clamp_min(1e-8)
++        assert relative_error < 0.04, (name, relative_error.item())
++
++
++def test_reference_resets_state_between_documents():
++    q = torch.ones(1, 3, 1, 1)
++    v = torch.tensor([2.0, 4.0, 8.0], requires_grad=True)
++    y = recurrent_kda(q, q, v.view_as(q), torch.zeros_like(q), q[..., 0] * 0.5, [0, 2, 3])
++    torch.testing.assert_close(y.flatten(), torch.tensor([1.0, 2.5, 4.0]))
++    torch.testing.assert_close(torch.autograd.grad(y.sum(), v)[0], torch.tensor([0.75, 0.5, 0.5]))
+diff --git a/tests/test_glm5_next_moe_chunks.py b/tests/test_glm5_next_moe_chunks.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5feb9792e2acb486a6ec15affc380efae07f29dc
+--- /dev/null
++++ b/tests/test_glm5_next_moe_chunks.py
+@@ -0,0 +1,65 @@
++"""Check chunked dispatch, replay and recomputation against a two-expert CPU model."""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++from torch.utils.checkpoint import checkpoint
++
++from slime_plugins.models.glm5_next.moe_chunking import _expert_forward, _FixedRoutes, _moe_forward
++
++
++@pytest.mark.parametrize("recompute", [False, True])
++def test_dispatch_with_uneven_routes(monkeypatch, recompute):
++    monkeypatch.setenv("ENABLE_ROUTING_REPLAY", "1")
++    monkeypatch.setenv("ROUTING_REPLAY_STAGE", "replay_forward")
++    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 1)
++    routes = torch.tensor([[1], [0], [0], [0], [1], [0], [0]])
++    router = SimpleNamespace(routing_replay=_FixedRoutes(routes))
++    source = torch.arange(21, dtype=torch.float32).reshape(7, 1, 3) / 10
++
++    def evaluate(chunk):
++        x = source.clone().requires_grad_()
++        weights = torch.tensor([0.75, 1.25], requires_grad=True)
++
++        def forward(values, intermediate_tensors=None, padding_mask=None):
++            indexes = router.routing_replay.pop_forward()[:, 0]
++            return (values * weights[indexes, None, None]).sin(), None
++
++        layer = SimpleNamespace(
++            _glm53_dispatch_chunk=chunk,
++            _glm53_original_forward=forward,
++            router=router,
++            config=SimpleNamespace(moe_router_topk=1),
++            ep_group=None,
++        )
++
++        def run(values):
++            return _moe_forward(layer, values)[0]
++
++        y = checkpoint(run, x, use_reentrant=True) if recompute else run(x)
++        y.square().sum().backward()
++        return y.detach(), x.grad, weights.grad
++
++    for actual, expected in zip(evaluate(3), evaluate(0), strict=True):
++        torch.testing.assert_close(actual, expected)
++    assert torch.equal(router.routing_replay.pop_backward(), routes)
++
++
++def test_expert_token_chunks_include_empty_expert():
++    counts = torch.tensor([0, 5, 2])
++
++    def evaluate(size):
++        x = torch.arange(21, dtype=torch.float32).reshape(7, 3).requires_grad_()
++        probs = torch.linspace(0.3, 0.9, 7).requires_grad_()
++
++        def forward(values, sizes, routing_probs, *buffers):
++            gain = torch.repeat_interleave(torch.tensor([0.5, 1.0, 1.5]), torch.as_tensor(sizes))
++            return values * (gain * routing_probs.view(-1))[:, None], None
++
++        experts = SimpleNamespace(_glm53_expert_chunk=size, _glm53_original_forward=forward)
++        y, _ = _expert_forward(experts, x, counts, probs)
++        return y, *torch.autograd.grad(y.sum(), (x, probs))
++
++    for result, expected in zip(evaluate(2), evaluate(0), strict=True):
++        torch.testing.assert_close(result, expected)
+diff --git a/tests/test_glm5_next_npu_cp.py b/tests/test_glm5_next_npu_cp.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..57e86dfb43e743ad5a6ef353d566d6268880d92a
+--- /dev/null
++++ b/tests/test_glm5_next_npu_cp.py
+@@ -0,0 +1,71 @@
++"""Distributed forward and gradient checks for GLM5-next context parallelism."""
++
++import os
++
++import torch
++import torch.distributed as dist
++
++
++def main():
++    import torch_npu
++    from slime_plugins.models.glm5_next import npu_backend as backend
++
++    rank = int(os.environ["LOCAL_RANK"])
++    torch_npu.npu.set_device(rank)
++    dist.init_process_group("hccl")
++    size = dist.get_world_size()
++    torch.manual_seed(142)
++    torch.set_num_threads(2)
++    boundaries = torch.tensor([0, 64, 64, 256], dtype=torch.int32, device="npu")
++    context = backend.build_cp_context(boundaries, dist.group.WORLD, 4)
++
++    def leaf(value):
++        return value.detach().clone().requires_grad_()
++
++    def check(actual, expected, name, reduce=False):
++        if reduce:
++            dist.all_reduce(actual)
++        torch.testing.assert_close(actual.float(), expected.float(), rtol=0.04, atol=0.006, msg=name)
++
++    x = (torch.randn(1, 256, 128) * 0.1).bfloat16().npu()
++    weight = (torch.randn(128, 4) * 0.1).bfloat16().npu()
++    dy = torch.randn_like(x)
++    xr, wr = leaf(x), leaf(weight)
++    reference = backend._convolve(xr, wr, "silu", boundaries)
++    reference.backward(dy)
++    xl, wl = leaf(x.chunk(size, 1)[rank]), leaf(weight)
++    actual, _ = backend.causal_conv1d(xl, wl, "silu", context)
++    actual.backward(dy.chunk(size, 1)[rank].contiguous())
++    check(actual, reference.chunk(size, 1)[rank], "conv output")
++    check(xl.grad, xr.grad.chunk(size, 1)[rank], "conv input gradient")
++    check(wl.grad, wr.grad, "conv weight gradient", reduce=True)
++
++    tensors = [(torch.randn(1, 256, 8, 128) * 0.1).bfloat16().npu() for _ in range(4)]
++    tensors.append(torch.rand(1, 256, 8).npu())
++    a = torch.zeros(8, device="npu")
++    bias = torch.zeros(8 * 128, device="npu")
++    grad = torch.randn_like(tensors[2])
++    common = dict(
++        cu_seqlens=boundaries, use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0
++    )
++    refs = [leaf(x) for x in tensors]
++    ar, br = leaf(a), leaf(bias)
++    reference, _ = backend.chunk_kda(*refs[:3], g=refs[3], beta=refs[4], A_log=ar, dt_bias=br, **common)
++    reference.backward(grad)
++    local = [leaf(x.chunk(size, 1)[rank]) for x in tensors]
++    al, bl = leaf(a), leaf(bias)
++    actual, _ = backend.chunk_kda(
++        *local[:3], g=local[3], beta=local[4], A_log=al, dt_bias=bl, cp_context=context, **common
++    )
++    actual.backward(grad.chunk(size, 1)[rank].contiguous())
++    check(actual, reference.chunk(size, 1)[rank], "KDA output")
++    for name, lhs, rhs in zip(["q", "k", "v", "g", "beta"], local, refs, strict=True):
++        check(lhs.grad, rhs.grad.chunk(size, 1)[rank], "KDA " + name)
++    check(al.grad, ar.grad, "KDA A_log", reduce=True)
++    check(bl.grad, br.grad, "KDA dt_bias", reduce=True)
++    torch.npu.synchronize()
++    dist.destroy_process_group()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/test_glm5_next_sparse_index_compaction.py b/tests/test_glm5_next_sparse_index_compaction.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d5bd9bccefbc792280006166bf89043c2d8df9ad
+--- /dev/null
++++ b/tests/test_glm5_next_sparse_index_compaction.py
+@@ -0,0 +1,49 @@
++"""Regression coverage for SparseFlashAttention index compaction; NPU tests are opt-in."""
++
++import os
++import pytest
++import torch
++
++from slime_plugins.models.glm5_next import ascendc_sparse_attention as module
++
++
++@pytest.mark.parametrize("rows,width", [(0, 2112), (4, 0), (8, 17), (128, 2112), (1024, 2112)])
++@pytest.mark.parametrize("device", ["cpu", "npu"])
++def test_compaction(rows, width, device):
++    if device == "npu":
++        if os.environ.get("GLM53_TEST_NPU") != "1":
++            pytest.skip("Set GLM53_TEST_NPU=1 on an idle NPU")
++        pytest.importorskip("torch_npu")
++    torch.manual_seed(53)
++    x = torch.randint(-2, 40, (rows, 1, width), dtype=torch.int32)
++    if rows and width:
++        x[0] = -1
++        if rows > 1:
++            x[1] = 7  # duplicates must remain, in original order
++    # Non-contiguous inputs exercise the public API.
++    x = x.transpose(0, 2).contiguous().transpose(0, 2)
++    actual = module.compact_sparse_indices(x.to(device), 32).cpu()
++    expect = torch.full_like(x, -1)
++    for row in range(rows):
++        valid = x[row, 0][(x[row, 0] >= 0) & (x[row, 0] < 32)]
++        expect[row, 0, : valid.numel()] = valid
++    assert actual.dtype == torch.int32
++    assert actual.is_contiguous()
++    assert torch.equal(actual, expect)
++
++
++def test_float_position_keys_preserve_order():
++    # Check all possible keys for the optimized width, not just random values.
++    width = 2112
++    keys = torch.randperm(2 * width, generator=torch.Generator().manual_seed(53))
++    assert torch.equal(keys.argsort(), keys.float().argsort())
++
++
++@pytest.mark.parametrize("device,explicit_kv", [("Ascend910_9382", False), ("Ascend950", True)])
++def test_sfa_kv_layout(device, explicit_kv):
++    assert module.uses_explicit_kv(device) is explicit_kv
++
++
++def test_reject_unsupported_soc():
++    with pytest.raises(RuntimeError, match="Ascend910B"):
++        module.uses_explicit_kv("Ascend910B")
+diff --git a/tests/test_glm5_next_swiglu.py b/tests/test_glm5_next_swiglu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..12c1c290cb3faa7029b40dd21f5d60f98dd5cdbc
+--- /dev/null
++++ b/tests/test_glm5_next_swiglu.py
+@@ -0,0 +1,41 @@
++"""Forward/backward and clamp-boundary checks for the shared torch SwiGLU."""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++import torch.nn.functional as F
++
++pytest.importorskip("torch_npu")
++pytestmark = pytest.mark.skipif(not torch.npu.is_available(), reason="requires NPU")
++from slime_plugins.models.glm5_next import ops
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
++@pytest.mark.parametrize("rows,noncontiguous", [(0, False), (17, False), (512, False), (17, True)])
++def test_swiglu_forward_backward(dtype, rows, noncontiguous):
++    torch.manual_seed(53)
++    width, limit = 2048, 10.0
++    data = (torch.randn(rows, 2 * width, device="npu") * 12).to(dtype)
++    if rows:
++        edges = torch.tensor([-11.0, -10.0, -9.0, 0.0, 9.0, 10.0, 11.0], device="npu", dtype=dtype)
++        data[0, :7] = edges
++        data[0, width : width + 7] = edges
++    if noncontiguous:
++        data = data.t().contiguous().t()
++    x = data.detach().requires_grad_()
++    baseline = data.detach().clone().requires_grad_()
++    actual = ops.ClampedSwiGLU(SimpleNamespace(activation_func_clamp_value=limit))(x)
++    gate, up = baseline.float().chunk(2, dim=-1)
++    expected = (F.silu(gate.clamp(max=limit)) * up.clamp(-limit, limit)).to(dtype)
++    grad = torch.randn_like(actual)
++    actual.backward(grad)
++    expected.backward(grad)
++    torch.npu.synchronize()
++    for actual, reference in ((actual, expected), (x.grad, baseline.grad)):
++        assert torch.isfinite(actual).all()
++        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
++    if rows:
++        assert x.grad[0, 6].item() == 0  # gate above upper clamp
++        assert x.grad[0, width].item() == 0  # up below lower clamp
++        assert x.grad[0, width + 6].item() == 0  # up above upper clamp
+diff --git a/tests/test_glm5_next_vision_merger.py b/tests/test_glm5_next_vision_merger.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9eaead25bda40381eee824c73637fe7815e55ce4
+--- /dev/null
++++ b/tests/test_glm5_next_vision_merger.py
+@@ -0,0 +1,116 @@
++"""Merger storage, checkpoint mappings, and optimizer-update regression tests.
++
++Extract the relevant definitions to avoid initializing Megatron process groups.
++"""
++
++import ast
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++from transformers.models.glm_ocr.modeling_glm_ocr import GlmOcrVisionPatchMerger
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def definitions(path, names, namespace):
++    nodes = [
++        n
++        for n in ast.parse((ROOT / path).read_text()).body
++        if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in names
++    ]
++    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
++
++
++ns = dict(torch=torch, nn=nn, F=F, GlmOcrVisionPatchMerger=GlmOcrVisionPatchMerger)
++definitions("slime_plugins/models/glm5_next/ops.py", {"swiglu_with_limit"}, ns)
++definitions(
++    "slime_plugins/models/glm5_next/vision.py",
++    {"vision_swiglu_with_limit", "Glm5NextVisionLayerNorm", "Glm5NextVisionMerger"},
++    ns,
++)
++definitions("slime/backends/megatron_utils/hf_to_megatron/common.py", {"strip_mcore_wrappers"}, ns)
++definitions("slime/backends/megatron_utils/hf_to_megatron/glm5_next.py", {"glm5_next_hf_tensor"}, ns)
++definitions("slime/backends/megatron_utils/megatron_to_hf/glm5_next.py", {"convert_glm5_next_to_hf"}, ns)
++definitions("slime/backends/megatron_utils/megatron_to_hf/__init__.py", {"convert_to_hf"}, ns)
++CONFIG = SimpleNamespace(out_hidden_size=16, projection_intermediate_size=24, hidden_act="gelu", swiglu_limit=10.0)
++
++
++class Reader(dict):
++    def get_tensor(self, name):
++        return self[name]
++
++
++def model():
++    return ns["Glm5NextVisionMerger"](CONFIG)
++
++
++def test_legacy_and_packed_state_dict_roundtrip():
++    old = GlmOcrVisionPatchMerger(16, 24, "gelu")
++    state = old.state_dict()
++    m = model()
++    m.load_state_dict(state, strict=True)
++    torch.testing.assert_close(
++        m.gate_up_proj.weight, torch.cat((old.gate_proj.weight, old.up_proj.weight)), rtol=0, atol=0
++    )
++    assert not hasattr(m, "gate_proj") and not hasattr(m, "up_proj")
++    assert "gate_up_proj.weight" in dict(m.named_parameters())
++    assert len(list(m.parameters())) == len(list(old.parameters())) - 1
++    restored = model()
++    restored.load_state_dict(m.state_dict(), strict=True)
++    x = torch.randn(9, 16)
++    torch.testing.assert_close(m(x), restored(x), rtol=0, atol=0)
++    assert "gate_proj.weight" in state  # loader must not mutate caller's dict
++
++
++def test_incomplete_legacy_state_dict_fails():
++    state = GlmOcrVisionPatchMerger(16, 24, "gelu").state_dict()
++    del state["up_proj.weight"]
++    with pytest.raises(RuntimeError):
++        model().load_state_dict(state, strict=True)
++
++
++@pytest.mark.parametrize("wrapper", ["", "module.", "module.module."])
++def test_streaming_hf_load_and_rollout_export(wrapper):
++    prefix = "model.visual.merger."
++    reader = Reader({prefix + "gate_proj.weight": torch.randn(24, 16), prefix + "up_proj.weight": torch.randn(24, 16)})
++    name = prefix + "gate_up_proj.weight"
++    packed = ns["glm5_next_hf_tensor"](wrapper + name, reader, None)
++    exported = dict(ns["convert_to_hf"](None, "glm5_next", wrapper + name, packed))
++    assert exported.keys() == reader.keys()
++    for key in reader:
++        torch.testing.assert_close(exported[key], reader[key], rtol=0, atol=0)
++    torch.testing.assert_close(ns["glm5_next_hf_tensor"](name, Reader({name: packed}), None), packed, rtol=0, atol=0)
++    # Other model families retain their visual parameter mapping.
++    assert ns["convert_to_hf"](None, "qwen3_vl", wrapper + name, packed)[0][0] == name
++
++
++def test_forward_backward_optimizer_and_no_weight_concat():
++    m = model()
++    x = torch.randn(9, 16, requires_grad=True)
++    z = m.act1(m.post_projection_norm(m.proj(x)))
++    reference = m.down_proj(ns["vision_swiglu_with_limit"](F.linear(z, m.gate_up_proj.weight), 10.0))
++    with patch.object(torch, "cat", side_effect=AssertionError("forward must not concatenate weights")):
++        actual = m(x)
++    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
++    params = [x] + list(m.parameters())
++    dy = torch.randn_like(actual)
++    expected_grads = torch.autograd.grad(reference, params, dy)
++    actual.backward(dy)
++    for p, g in zip(params, expected_grads):
++        torch.testing.assert_close(p.grad, g, rtol=0, atol=0)
++        assert torch.isfinite(p.grad).all()
++    before = m.gate_up_proj.weight.detach().clone()
++    torch.optim.SGD(m.parameters(), lr=0.1).step()
++    assert not torch.equal(before, m.gate_up_proj.weight)
++    gate, up = m.gate_up_proj.weight.chunk(2, dim=0)
++    assert not torch.equal(before[:24], gate) and not torch.equal(before[24:], up)
++    exported = dict(
++        ns["convert_to_hf"](None, "glm53", "model.visual.merger.gate_up_proj.weight", m.gate_up_proj.weight)
++    )
++    torch.testing.assert_close(exported["model.visual.merger.gate_proj.weight"], gate, rtol=0, atol=0)
++    assert not torch.equal(actual.detach(), m(x).detach())
+diff --git a/tests/test_sglang_environment_compat.py b/tests/test_sglang_environment_compat.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..688ecd2030bd095713c47299d96bb52fea32ba9b
+--- /dev/null
++++ b/tests/test_sglang_environment_compat.py
+@@ -0,0 +1,33 @@
++"""Allocator and port settings passed to SGLang workers."""
++
++import pytest
++
++from slime.backends.sglang_utils.runtime import prepare_server_environment
++
++
++@pytest.mark.parametrize(
++    "allocator,expected",
++    [
++        ("expandable_segments:True", None),
++        (
++            "pinned_use_cuda_host_register:True,expandable_segments:False,max_split_size_mb:128",
++            "pinned_use_cuda_host_register:True,max_split_size_mb:128",
++        ),
++        ("max_split_size_mb:128, expandable_segments:1", "max_split_size_mb:128"),
++        ("pinned_use_cuda_host_register:True", "pinned_use_cuda_host_register:True"),
++    ],
++)
++def test_server_environment_preserves_supported_allocator_options(allocator, expected):
++    environ = {"PYTORCH_ALLOC_CONF": allocator, "PYTORCH_CUDA_ALLOC_CONF": allocator}
++    prepare_server_environment(environ)
++    assert environ.get("PYTORCH_ALLOC_CONF") == expected
++    assert environ.get("PYTORCH_CUDA_ALLOC_CONF") == expected
++    assert environ["MC_MIN_PRC_PORT"] == "27000"
++    assert environ["MC_MAX_PRC_PORT"] == "28000"
++
++
++@pytest.mark.parametrize("name", ["MC_MIN_RPC_PORT", "MC_MAX_RPC_PORT", "MC_MIN_PRC_PORT", "MC_MAX_PRC_PORT"])
++def test_server_environment_preserves_explicit_mooncake_range(name):
++    environ = {name: "31000"}
++    prepare_server_environment(environ)
++    assert environ == {name: "31000"}
+diff --git a/tests/test_glm5_next_sfa.py b/tests/test_glm5_next_sfa.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9cc465ad4088afd5a959f36a2a188a230eb01a44
+--- /dev/null
++++ b/tests/test_glm5_next_sfa.py
+@@ -0,0 +1,80 @@
++"""Optional A3/A5 SparseFlashAttention numerical regression; run with GLM53_TEST_NPU=1."""
++
++import os
++
++import pytest
++
++
++@pytest.mark.integration
++@pytest.mark.skipif(os.environ.get("GLM53_TEST_NPU") != "1", reason="Set GLM53_TEST_NPU=1 on an idle A3/A5 NPU")
++def test_sfa_short_query_high_indices_forward_backward():
++    torch = pytest.importorskip("torch")
++    pytest.importorskip("torch_npu")
++    if not torch.npu.is_available():
++        pytest.skip("requires an available NPU")
++    device_index = torch.npu.current_device()
++    if not torch.npu.get_device_name(device_index).startswith(("Ascend910_93", "Ascend950")):
++        pytest.skip("requires Ascend A3 or A5")
++
++    from slime_plugins.models.glm5_next.ascendc_sparse_attention import sparse_attention
++
++    # Exercise forward and backward partitioning with short queries and
++    # nonmonotonic sparse indices.
++    query_tokens, kv_tokens, heads, dim = 65, 4096, 64, 512
++    scale = 256**-0.5
++    generator = torch.Generator(device="cpu").manual_seed(530205)
++    q_cpu = torch.randn(query_tokens, heads, dim, generator=generator).to(torch.bfloat16)
++    kv_cpu = torch.randn(kv_tokens, 1, dim, generator=generator).to(torch.bfloat16)
++    dout_cpu = (torch.randn(query_tokens, heads, dim, generator=generator) * 0.01).to(torch.bfloat16)
++    indices = torch.full((query_tokens, 1, 2112), -1, dtype=torch.int32)
++    for row in range(query_tokens):
++        # Queries correspond to the final 65 positions of the KV sequence.
++        # Pick 512 complete pools of four keys and retain the incomplete tail:
++        # each row has 2048..2051 valid slots, followed by native-width padding.
++        end = kv_tokens - query_tokens + row + 1
++        complete_pools = end // 4
++        pools = torch.linspace(0, complete_pools - 1, 512).floor().long().roll(row % 512)
++        selected = (pools[:, None] * 4 + torch.arange(4)).reshape(-1)
++        selected = torch.cat((selected, torch.arange(complete_pools * 4, end)))
++        indices[row, 0, : selected.numel()] = selected.to(torch.int32)
++
++    # Independent CPU FP32 attention: one shared tensor is used as both K and V,
++    # so autograd includes both contributions to its gradient. Process every
++    # query/head, retaining exact BF16 inputs but bounding reference graph size.
++    reference_kv = kv_cpu.float().requires_grad_()
++    expected_dkv = torch.zeros_like(reference_kv)
++    expected_out, expected_dq = [], []
++    for row in range(query_tokens):
++        query = q_cpu[row].float().requires_grad_()
++        selected = indices[row, 0]
++        selected = selected[selected >= 0].long()
++        shared = reference_kv[selected, 0]
++        output = ((query @ shared.T) * scale).softmax(-1) @ shared
++        dq, dkv = torch.autograd.grad(output, (query, reference_kv), dout_cpu[row].float())
++        expected_out.append(output.detach())
++        expected_dq.append(dq)
++        expected_dkv.add_(dkv)
++    expected = (torch.stack(expected_out), torch.stack(expected_dq), expected_dkv)
++
++    device = f"npu:{device_index}"
++    with torch.npu.device(device_index):
++        q = q_cpu.to(device).requires_grad_()
++        kv = kv_cpu.to(device).requires_grad_()
++        output = sparse_attention(q, kv, indices.to(device), scale)
++        dq, dkv = torch.autograd.grad(output, (q, kv), dout_cpu.to(device))
++        actual = tuple(tensor.detach().float().cpu() for tensor in (output, dq, dkv))
++
++    # Allow for BF16 rounding when comparing against the FP32 reference.
++    for name, result, reference in zip(("out", "dq", "dkv"), actual, expected, strict=True):
++        assert result.shape == reference.shape, name
++        assert torch.isfinite(result).all(), name
++        error = (result - reference).double()
++        relative_rms = error.norm() / reference.double().norm().clamp_min(1e-12)
++        assert relative_rms < 0.01, (name, relative_rms.item())
++        if name != "dkv":
++            # Check each query too, so a few bad work-partition boundaries cannot
++            # be hidden by averaging over correctly computed queries.
++            query_error = error.flatten(1).norm(dim=1)
++            query_norm = reference.double().flatten(1).norm(dim=1).clamp_min(1e-12)
++            worst_query_rms = (query_error / query_norm).max()
++            assert worst_query_rms < 0.01, (name, worst_query_rms.item())
+diff --git a/slime/observability/profile_utils.py b/slime/observability/profile_utils.py
+index 68569bac8997f900f1d1dfe79f3cc4f6f8c38929..9c97d5667dd11d95f508c13c21159eec1f229f21 100644
+--- a/slime/observability/profile_utils.py
++++ b/slime/observability/profile_utils.py
+@@ -1,6 +1,8 @@
+ import logging
++import os
+ import time
+ import traceback
++from contextlib import nullcontext
+ from pathlib import Path
+ 
+ import torch
+@@ -11,6 +13,44 @@ from slime.utils.memory_utils import print_memory
+ logger = logging.getLogger(__name__)
+ 
+ 
++def npu_update_profile_dir(update: int):
++    """Return the shared trace directory for the selected one-based update."""
++    root = os.environ.get("GLM53_PROFILE_DIR")
++    if root and str(update) == os.environ.get("GLM53_PROFILE_UPDATE"):
++        return Path(root) / f"update{update}"
++    return None
++
++
++def npu_train_step_profile(update: int):
++    root = npu_update_profile_dir(update)
++    if root is None:
++        return nullcontext()
++
++    from megatron.core import parallel_state as mpu
++
++    if mpu.get_pipeline_model_parallel_first_rank() != 0:
++        return nullcontext()
++
++    import torch_npu.profiler as prof
++
++    rank = torch.distributed.get_rank()
++    stage = mpu.get_pipeline_model_parallel_rank()
++    path = root / "train" / f"pp{stage}_rank{rank}"
++    path.mkdir(parents=True, exist_ok=True)
++    return prof.profile(
++        activities=[prof.ProfilerActivity.CPU, prof.ProfilerActivity.NPU],
++        on_trace_ready=prof.tensorboard_trace_handler(str(path), worker_name=f"rank{rank}"),
++        record_shapes=True,
++        profile_memory=True,
++        with_stack=False,
++        experimental_config=prof._ExperimentalConfig(
++            profiler_level=prof.ProfilerLevel.Level1,
++            aic_metrics=prof.AiCMetrics.AiCoreNone,
++            export_type="text",
++        ),
++    )
++
++
+ class TrainProfiler:
+     def __init__(self, args):
+         self.args = args

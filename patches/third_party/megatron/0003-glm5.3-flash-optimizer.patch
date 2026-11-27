@@ -1,0 +1,119 @@
+From e296f6610d696c4a64d5d30f136b77bf706807fa Mon Sep 17 00:00:00 2001
+From: Slime Ascend Integration <integration@localhost>
+Date: Mon, 23 Nov 2026 12:00:00 +0800
+Subject: [PATCH] Restore native FP32 offload and mixed optimizer shards
+
+Base-commit: 4b4acac9a1d28ea6829c8d4f566d75698a21249d
+Apply after the existing dev patches for this base in MANIFEST.toml.
+
+---
+diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
+index c87ccd5ff311b600d85fc3b727684651c26f4238..8931280ddad317080c7947d4a2997fb1e0c61a53 100644
+--- a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
++++ b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
+@@ -271,7 +271,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
+                 orig_param = param
+                 cpu_copy = False
+                 if offload_params_numel < offload_threshold and param.is_cuda:
+-                    param = param.detach().clone().cpu().pin_memory()
++                    param = param.detach().clone().cpu()
++                    if self.pin_cpu_params:
++                        param = param.pin_memory()
+                     offload_params_numel += param.numel()
+                     cpu_copy = True
+                 if self.param_update_in_fp32 and param.dtype != torch.float32:
+@@ -370,15 +372,23 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
+         if not self.param_update_in_fp32:
+             return
+         for param, v in self.state.items():
+-            fp32_param = self.param_to_fp32_param[param]
++            # Native FP32 parameters use their inner parameter or CPU copy directly.
++            fp32_param = self.param_to_inner_param[param]
+             fp32_param.data.copy_(v["master_param"])
+ 
++    @torch.no_grad()
+     def update_fp32_param_by_new_param(self):
+         """
+         Update the fp32 parameters by the new parameters.
+         """
+         for param, fp32_param in self.param_to_fp32_param.items():
+             fp32_param.data.copy_(param)
++        # Native FP32 parameters have CPU optimizer copies but no separate
++        # mixed-precision master entry. Refresh them after checkpoint loading
++        # to prevent stale initialization from being copied back on first step.
++        for param, cpu_param in self.gpu_params_map_cpu_copy.items():
++            if param not in self.param_to_fp32_param:
++                cpu_param.data.copy_(param.data)
+ 
+     def _register_load_state_dict_hooks(self):
+         def pre_load_state_dict_hook(self, state_dict):
+diff --git a/megatron/core/optimizer/distrib_optimizer.py b/megatron/core/optimizer/distrib_optimizer.py
+index 4de315ed057c133bc0fac84987f1b2a534a9d268..080793dd4248c623decc0c47aa9fa20bedc87819 100644
+--- a/megatron/core/optimizer/distrib_optimizer.py
++++ b/megatron/core/optimizer/distrib_optimizer.py
+@@ -774,6 +774,17 @@
+         ) = self._build_model_and_main_param_groups(
+             self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
+         )
++
++        # Main-parameter construction orders each group as FP32 then FP16/BF16.
++        # Rebuild the index in that order so checkpoint save/load address the
++        # matching optimizer shard, including mixed-dtype parameter groups.
++        self.model_param_group_index_map = {
++            param: (group_index, param_index)
++            for group_index, (fp32_params, float16_params) in enumerate(
++                zip(self.model_fp32_groups, self.model_float16_groups)
++            )
++            for param_index, param in enumerate([*fp32_params, *float16_params])
++        }
+ 
+         if isinstance(self.optimizer, HybridDeviceOptimizer):
+             self.optimizer = HybridDeviceOptimizer(
+@@ -2096,10 +2107,8 @@
+                     for src_tensors, (model_param, param_range_map) in zip(
+                         bucket_state, gbuf_range_map["param_map"].items()
+                     ):
+-                        # Local metadata used for checkpoint merging/filtering, not optimizer state.
+-                        src_tensors.pop('padding', None)
+-                        # Step is restored from optimizer param_groups.
+-                        src_tensors.pop('step', None)
++                        # Both keys are checkpoint metadata; preserve the loaded bucket for subsequent readers.
++                        src_tensors = {k: v for k, v in src_tensors.items() if k not in ("padding", "step")}
+ 
+                         # Main param & optimizer states.
+                         self._set_main_param_and_optimizer_states(model_param, src_tensors)
+diff --git a/tests/unit_tests/test_optimizer_cpu_offloading.py b/tests/unit_tests/test_optimizer_cpu_offloading.py
+index 33febbb..c6ee5e0 100644
+--- a/tests/unit_tests/test_optimizer_cpu_offloading.py
++++ b/tests/unit_tests/test_optimizer_cpu_offloading.py
+@@ -253,3 +253,30 @@ def test_overlap_cpu_optimizer_d2h_h2d_sync_correctness(
+         assert torch.allclose(
+             v, ref_params[k], atol=1e-03
+         ), f"Weight {k} value mismatch, max error: {(v - ref_params[k]).abs().max()}"
++
++@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
++@pytest.mark.parametrize("offload", [False, True])
++def test_refresh_optimizer_parameters_after_model_load(dtype, offload):
++    param = nn.Parameter(torch.full((4,), 7.0, dtype=dtype))
++    inner = nn.Parameter(torch.zeros(4))
++    optimizer = HybridDeviceOptimizer.__new__(HybridDeviceOptimizer)
++    optimizer.param_to_fp32_param = {} if dtype == torch.float32 else {param: inner}
++    optimizer.gpu_params_map_cpu_copy = {param: inner} if offload else {}
++
++    optimizer.update_fp32_param_by_new_param()
++
++    if offload or dtype != torch.float32:
++        torch.testing.assert_close(inner, param.float())
++        cpu_optimizer = torch.optim.SGD([inner], lr=0.1)
++        inner.grad = torch.ones_like(inner)
++        cpu_optimizer.step()
++        torch.testing.assert_close(inner, torch.full_like(inner, 6.9))
++    else:
++        torch.testing.assert_close(param, torch.full_like(param, 7.0))
++
++
++def test_refresh_optimizer_parameters_without_offloaded_copies():
++    optimizer = HybridDeviceOptimizer.__new__(HybridDeviceOptimizer)
++    optimizer.param_to_fp32_param = {}
++    optimizer.gpu_params_map_cpu_copy = {}
++    optimizer.update_fp32_param_by_new_param()
