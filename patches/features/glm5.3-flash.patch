@@ -157,18 +157,10 @@ index 14aa296a72aeec5b867ab4614b0fad55762e71f8..9bbaa48b9bfeb09a7093c0b14fbeb014
      if match:
          layer, rest = match.groups()
 diff --git a/slime/backends/megatron_utils/model.py b/slime/backends/megatron_utils/model.py
-index 1d208dc73fe3da2573d34577128171a7760ab7bd..f555d8810ed8d7d10a4740d244ca50c6eb4af173 100644
+index 1d208dc73fe3da2573d34577128171a7760ab7bd..8ea087c06e7f376beae42701d973030c306eb592 100644
 --- a/slime/backends/megatron_utils/model.py
 +++ b/slime/backends/megatron_utils/model.py
-@@ -29,6 +29,7 @@ try:
- except ImportError:
-     from megatron.core.utils import unwrap_model
- from slime.observability import logging_utils, train_metric_utils
-+from slime.observability.profile_utils import npu_train_step_profile
- from slime.utils import accelerator
- from slime.utils.memory_utils import clear_memory
- 
-@@ -36,6 +37,7 @@ from .checkpoint import load_checkpoint, save_checkpoint
+@@ -36,6 +36,7 @@ from .checkpoint import load_checkpoint, save_checkpoint
  from .data import DataIterator, get_batch
  from .loss import ROLLOUT_TOP_P_TOKEN_KEYS, get_rollout_top_p_logprob_kwargs, loss_function
  from .model_provider import get_model_provider_func
@@ -176,7 +168,7 @@ index 1d208dc73fe3da2573d34577128171a7760ab7bd..f555d8810ed8d7d10a4740d244ca50c6
  from .stateless_adam import StatelessAdam
  
  logger = logging.getLogger(__name__)
-@@ -669,6 +671,7 @@ def train_one_step(
+@@ -669,6 +670,7 @@ def train_one_step(
  
      # Forward pass.
      forward_backward_func = get_forward_backward_func()
@@ -184,7 +176,7 @@ index 1d208dc73fe3da2573d34577128171a7760ab7bd..f555d8810ed8d7d10a4740d244ca50c6
      losses_reduced = forward_backward_func(
          forward_step_func=_wrap_forward_step_with_microbatch_pbar(forward_step, microbatch_pbar),
          data_iterator=data_iterator,
-@@ -678,7 +681,10 @@ def train_one_step(
+@@ -678,7 +680,10 @@ def train_one_step(
          micro_batch_size=args.micro_batch_size,
          decoder_seq_length=args.decoder_seq_length,
          forward_only=False,
@@ -195,38 +187,6 @@ index 1d208dc73fe3da2573d34577128171a7760ab7bd..f555d8810ed8d7d10a4740d244ca50c6
  
      valid_step = True
      grad_norm = float("nan")
-@@ -856,18 +862,19 @@ def train(
-     for step_id in range(num_steps_per_rollout):
- 
-         # Run training step.
--        loss_dict, grad_norm = train_one_step(
--            args,
--            rollout_id,
--            step_id,
--            data_iterator,
--            model,
--            optimizer,
--            opt_param_scheduler,
--            num_microbatches[step_id],
--            global_batch_sizes[step_id],
--            microbatch_pbar=microbatch_pbar,
--        )
-+        with npu_train_step_profile(rollout_id * num_steps_per_rollout + step_id + 1):
-+            loss_dict, grad_norm = train_one_step(
-+                args,
-+                rollout_id,
-+                step_id,
-+                data_iterator,
-+                model,
-+                optimizer,
-+                opt_param_scheduler,
-+                num_microbatches[step_id],
-+                global_batch_sizes[step_id],
-+                microbatch_pbar=microbatch_pbar,
-+            )
- 
-         if step_id == 0:
-             # Enable forward pre-hook after training step has successfully run. All subsequent
 diff --git a/slime/backends/megatron_utils/pipeline_shapes.py b/slime/backends/megatron_utils/pipeline_shapes.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..d5104fbc6afc3f1a9b7c578ce09e0f6440220e72
@@ -402,7 +362,7 @@ index dd06316b37992ee31d78875b04552e35bce2a479..8c8fb5a831c5f2e0c1d2a4b3dea0987b
          dist.barrier(group=get_gloo_group())
  
 diff --git a/slime/backends/sglang_utils/sglang_engine.py b/slime/backends/sglang_utils/sglang_engine.py
-index 32a5ba9561d119cf071960f8a5e708983e195f84..e53c4554b5838cb2e78469298bb97d383150e92b 100644
+index 32a5ba9561d119cf071960f8a5e708983e195f84..c4fda9c6aee98e590b4d4f9cab97e113cba3b07d 100644
 --- a/slime/backends/sglang_utils/sglang_engine.py
 +++ b/slime/backends/sglang_utils/sglang_engine.py
 @@ -25,6 +25,17 @@ from slime.utils.model_config import sglang_model_config_overrides
@@ -569,13 +529,7 @@ index 32a5ba9561d119cf071960f8a5e708983e195f84..e53c4554b5838cb2e78469298bb97d38
          response.raise_for_status()
          return response
  
-@@ -542,11 +610,13 @@ class SGLangEngine(RayActor):
-         profile_by_stage: bool = False,
-         with_stack: bool | None = None,
-         record_shapes: bool | None = None,
-+        npu_profile_tp_rank: int | None = None,
-     ):
-         if self.node_rank != 0:
+@@ -547,6 +615,7 @@ class SGLangEngine(RayActor):
              return
          response = requests.post(
              f"http://{self.server_host}:{self.server_port}/start_profile",
@@ -583,15 +537,7 @@ index 32a5ba9561d119cf071960f8a5e708983e195f84..e53c4554b5838cb2e78469298bb97d38
              json={
                  "output_dir": output_dir,
                  "start_step": start_step,
-@@ -555,6 +625,7 @@ class SGLangEngine(RayActor):
-                 "profile_by_stage": profile_by_stage,
-                 "with_stack": with_stack,
-                 "record_shapes": record_shapes,
-+                "npu_profile_tp_rank": npu_profile_tp_rank,
-             },
-         )
-         response.raise_for_status()
-@@ -563,7 +634,10 @@ class SGLangEngine(RayActor):
+@@ -563,7 +632,10 @@ class SGLangEngine(RayActor):
      def stop_profile(self):
          if self.node_rank != 0:
              return
@@ -672,26 +618,10 @@ index 7f08120193a5c68a5ec96dad1d6be3b5243c7d6b..15599d0410c712049258af33e983a8f9
                      placement_group=pg,
                      placement_group_bundle_index=i,
 diff --git a/slime/ray/rollout.py b/slime/ray/rollout.py
-index 07c83ab439b074ec2359833a172b5bb50f7af365..39f668d3a0323e42c67a20a5c0ae7173b6a3ed51 100644
+index 07c83ab439b074ec2359833a172b5bb50f7af365..d7057f3d67c8b62e83da91b7341ce89e2e33a961 100644
 --- a/slime/ray/rollout.py
 +++ b/slime/ray/rollout.py
-@@ -2,6 +2,7 @@ import itertools
- import logging
- import time
- import uuid
-+from contextlib import contextmanager
- from pathlib import Path
- from typing import Any
- 
-@@ -11,6 +12,7 @@ from slime.data.batch_builder import BatchBuilder
- from slime.data.transport import DiskPayloadRef, accept_raw_rollout, check_rollout_storage, load_rollout_samples
- from slime.observability import logging_utils
- from slime.observability.logging_utils import configure_logger, init_tracking
-+from slime.observability.profile_utils import npu_update_profile_dir
- from slime.observability.rollout_data_utils import (
-     load_debug_rollout_data,
-     save_debug_rollout_data,
-@@ -179,7 +181,6 @@ class RolloutManager:
+@@ -179,7 +179,6 @@ class RolloutManager:
  
      def attach_training(self, args, deployment):
          """Bind a driver to the same serving owner, including after manager death."""
@@ -699,7 +629,7 @@ index 07c83ab439b074ec2359833a172b5bb50f7af365..39f668d3a0323e42c67a20a5c0ae7173
          from slime.ray.training_recovery import TrainingResume
  
          was_paused = self.pause_rollout_admission()
-@@ -191,11 +192,14 @@ class RolloutManager:
+@@ -191,11 +190,14 @@ class RolloutManager:
          self.servers = deployment.servers
          if self.recovery is not None:
              self.recovery.reconcile_checkpoint()
@@ -719,7 +649,7 @@ index 07c83ab439b074ec2359833a172b5bb50f7af365..39f668d3a0323e42c67a20a5c0ae7173
          # The saved load boundary wins over new CLI settings, while trainer
          # parallelism and memory limits still come from the new attempt.
          weight_version = getattr(args, "update_weight_start_version", 0)
-@@ -243,10 +247,11 @@ class RolloutManager:
+@@ -243,10 +245,11 @@ class RolloutManager:
  
      def _source_state(self):
          """Snapshot the cursor, leaving live queue tasks with their controller."""
@@ -734,51 +664,6 @@ index 07c83ab439b074ec2359833a172b5bb50f7af365..39f668d3a0323e42c67a20a5c0ae7173
          if state_dict := getattr(self.data_source, "state_dict", None):
              return state_dict()
          return None
-@@ -332,6 +337,34 @@ class RolloutManager:
-             self.servers = ray.get(self.serving.finish_rollout.remote())
-         return result
- 
-+    @contextmanager
-+    def _profile_rollout(self, rollout_id):
-+        directory = npu_update_profile_dir(rollout_id + 1)
-+        if directory is None:
-+            yield
-+            return
-+
-+        engine = self._get_updatable_server().engines[0]
-+        ray.get(engine.start_profile.remote(
-+            output_dir=str(directory / "rollout" / "engine0_tp0"),
-+            activities=["CPU", "GPU"],
-+            profile_by_stage=True,
-+            num_steps=8,
-+            npu_profile_tp_rank=0,
-+            record_shapes=True,
-+            with_stack=False,
-+        ))
-+        try:
-+            yield
-+        except BaseException:
-+            try:
-+                ray.get(engine.stop_profile.remote())
-+            except Exception:
-+                logger.exception("Failed to stop profiling after rollout %s failed", rollout_id)
-+            raise
-+        else:
-+            ray.get(engine.stop_profile.remote())
-+
-     def _generate(self, rollout_id, start_time):
-         if self.recovery is not None and rollout_id in self.recovery.batches:
-             batch = self.recovery.batches[rollout_id]
-@@ -352,7 +385,8 @@ class RolloutManager:
-             if self.args.rollout_data_transport == "straw":
-                 self.batch_builder.raw_ref = batch.raw
-         else:
--            data, metrics = self._get_rollout_data(rollout_id=rollout_id)
-+            with self._profile_rollout(rollout_id):
-+                data, metrics = self._get_rollout_data(rollout_id=rollout_id)
-             save_debug_rollout_data(
-                 self.args.save_debug_rollout_data,
-                 data,
 diff --git a/slime/ray/train_actor.py b/slime/ray/train_actor.py
 index e6f1730c621073edb5f775cb26a7e185156e3026..c2b5e733fd1bbd0f28e20d9a82b4157e668039d4 100644
 --- a/slime/ray/train_actor.py
@@ -2929,61 +2814,3 @@ index 0000000000000000000000000000000000000000..9cc465ad4088afd5a959f36a2a188a23
 +            query_norm = reference.double().flatten(1).norm(dim=1).clamp_min(1e-12)
 +            worst_query_rms = (query_error / query_norm).max()
 +            assert worst_query_rms < 0.01, (name, worst_query_rms.item())
-diff --git a/slime/observability/profile_utils.py b/slime/observability/profile_utils.py
-index 68569bac8997f900f1d1dfe79f3cc4f6f8c38929..9c97d5667dd11d95f508c13c21159eec1f229f21 100644
---- a/slime/observability/profile_utils.py
-+++ b/slime/observability/profile_utils.py
-@@ -1,6 +1,8 @@
- import logging
-+import os
- import time
- import traceback
-+from contextlib import nullcontext
- from pathlib import Path
- 
- import torch
-@@ -11,6 +13,44 @@ from slime.utils.memory_utils import print_memory
- logger = logging.getLogger(__name__)
- 
- 
-+def npu_update_profile_dir(update: int):
-+    """Return the shared trace directory for the selected one-based update."""
-+    root = os.environ.get("GLM53_PROFILE_DIR")
-+    if root and str(update) == os.environ.get("GLM53_PROFILE_UPDATE"):
-+        return Path(root) / f"update{update}"
-+    return None
-+
-+
-+def npu_train_step_profile(update: int):
-+    root = npu_update_profile_dir(update)
-+    if root is None:
-+        return nullcontext()
-+
-+    from megatron.core import parallel_state as mpu
-+
-+    if mpu.get_pipeline_model_parallel_first_rank() != 0:
-+        return nullcontext()
-+
-+    import torch_npu.profiler as prof
-+
-+    rank = torch.distributed.get_rank()
-+    stage = mpu.get_pipeline_model_parallel_rank()
-+    path = root / "train" / f"pp{stage}_rank{rank}"
-+    path.mkdir(parents=True, exist_ok=True)
-+    return prof.profile(
-+        activities=[prof.ProfilerActivity.CPU, prof.ProfilerActivity.NPU],
-+        on_trace_ready=prof.tensorboard_trace_handler(str(path), worker_name=f"rank{rank}"),
-+        record_shapes=True,
-+        profile_memory=True,
-+        with_stack=False,
-+        experimental_config=prof._ExperimentalConfig(
-+            profiler_level=prof.ProfilerLevel.Level1,
-+            aic_metrics=prof.AiCMetrics.AiCoreNone,
-+            export_type="text",
-+        ),
-+    )
-+
-+
- class TrainProfiler:
-     def __init__(self, args):
-         self.args = args
