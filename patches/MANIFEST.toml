@@ -242,7 +242,7 @@ file = "glm5.3-flash.patch"
 summary = "Support GLM-5.3 Flash training and rollout on Ascend"
 issue = "PR-142"
 base_commit = "18868a79b0b083a093798a94ed0f8cb4f71b9c14"
-sha256 = "1d0bc8becbb91961ed5ddbfb7c2c138f041a57de119cd28930ee2f12bfedf8d4"
+sha256 = "f0cbc13cb494c531e6d830ea4efe587058ef41ca3e414953b09f23974209d156"
 
 [[patches]]
 id = "megatron:glm5.3-flash"
@@ -262,7 +262,7 @@ file = "sglang/glm5.3-flash.patch"
 summary = "Align GLM-5.3 NPU inference, collectives and graph capture"
 issue = "PR-142"
 base_commit = "5b35f1badbd6e546e372ce61f9e41378b60003ed"
-sha256 = "3bb515ba47f9522a9bf66b7e100dc46beb19ecb2f49ccc722a5584a6f7ddaedc"
+sha256 = "d8898ba7d424d554d452ce9d8bb14916a1669b0d70f4e427382969e61a95a4fd"
 
 [[patches]]
 id = "sgl-kernel-npu:glm5.3-flash"

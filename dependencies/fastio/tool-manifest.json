@@ -1,0 +1,63 @@
+{
+  "packages": [
+    {
+      "package": "fuse-sshfs",
+      "url": "https://repo.openeuler.openatom.cn/openEuler-24.03-LTS-SP3/EPOL/main/aarch64/Packages/fuse-sshfs-3.7.3-3.oe2403sp3.aarch64.rpm",
+      "sha256": "3b9eb34af693ff365fd9565388893262e4fe25da51c1fde3b03010763666df35",
+      "signature": "/tmp/glm53-fastio-tools-1126/fuse-sshfs-3.7.3-3.oe2403sp3.aarch64.rpm: digests signatures OK",
+      "requires": [
+        "fuse3 >= 3.1.0",
+        "ld-linux-aarch64.so.1()(64bit)",
+        "ld-linux-aarch64.so.1(GLIBC_2.17)(64bit)",
+        "libc.so.6()(64bit)",
+        "libc.so.6(GLIBC_2.17)(64bit)",
+        "libc.so.6(GLIBC_2.28)(64bit)",
+        "libc.so.6(GLIBC_2.32)(64bit)",
+        "libc.so.6(GLIBC_2.33)(64bit)",
+        "libc.so.6(GLIBC_2.34)(64bit)",
+        "libc.so.6(GLIBC_2.38)(64bit)",
+        "libfuse3.so.3()(64bit)",
+        "libfuse3.so.3(FUSE_3.0)(64bit)",
+        "libfuse3.so.3(FUSE_3.1)(64bit)",
+        "libfuse3.so.3(FUSE_3.2)(64bit)",
+        "libglib-2.0.so.0()(64bit)",
+        "openssh-clients",
+        "rpmlib(CompressedFileNames) <= 3.0.4-1",
+        "rpmlib(FileDigests) <= 4.6.0-1",
+        "rpmlib(PayloadFilesHavePrefix) <= 4.0-1",
+        "rpmlib(PayloadIsXz) <= 5.2-1",
+        "rtld(GNU_HASH)"
+      ]
+    },
+    {
+      "package": "fuse3",
+      "url": "https://repo.openeuler.openatom.cn/openEuler-24.03-LTS-SP3/OS/aarch64/Packages/fuse3-3.16.2-3.oe2403sp3.aarch64.rpm",
+      "sha256": "538829cfe5bbadf554c4d05d9026ca429fded0ce2765623e6d5270f95c71e60c",
+      "signature": "/tmp/glm53-fastio-tools-1126/fuse3-3.16.2-3.oe2403sp3.aarch64.rpm: digests signatures OK",
+      "requires": [
+        "/sbin/ldconfig",
+        "/sbin/ldconfig",
+        "fuse-common",
+        "ld-linux-aarch64.so.1()(64bit)",
+        "ld-linux-aarch64.so.1(GLIBC_2.17)(64bit)",
+        "libc.so.6()(64bit)",
+        "libc.so.6(GLIBC_2.17)(64bit)",
+        "libc.so.6(GLIBC_2.28)(64bit)",
+        "libc.so.6(GLIBC_2.32)(64bit)",
+        "libc.so.6(GLIBC_2.33)(64bit)",
+        "libc.so.6(GLIBC_2.34)(64bit)",
+        "libc.so.6(GLIBC_2.38)(64bit)",
+        "libfuse3.so.3()(64bit)",
+        "libfuse3.so.3(FUSE_3.3)(64bit)",
+        "rpmlib(CompressedFileNames) <= 3.0.4-1",
+        "rpmlib(FileDigests) <= 4.6.0-1",
+        "rpmlib(PayloadFilesHavePrefix) <= 4.0-1",
+        "rpmlib(PayloadIsXz) <= 5.2-1",
+        "rtld(GNU_HASH)",
+        "which"
+      ]
+    }
+  ],
+  "version": "fusermount3 version: 3.16.2\nSSHFS version 3.7.3\nFUSE library version 3.16.2\nusing FUSE kernel interface version 7.38\n",
+  "state": "tools extracted under tmp; no host package installation or mount created"
+}
